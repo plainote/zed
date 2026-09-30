@@ -385,6 +385,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // No glass pass here yet (L0-10 fork is Metal only).
+                PrimitiveBatch::Glass(_glass) => Ok(()),
             }
             .with_context(|| {
                 format!(

@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, Glass, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -40,6 +40,10 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// Levels in the glass blur pyramid: 1/2, 1/4, 1/8 and 1/16 of the frame.
+const GLASS_BLUR_LEVELS: usize = 4;
+/// `set_vertex_bytes` takes at most 4 KB, so glass is drawn in chunks.
+const GLASS_PER_DRAW: usize = 4096 / mem::size_of::<Glass>();
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -126,6 +130,15 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    glass_downsample_pipeline_state: metal::RenderPipelineState,
+    glass_upsample_pipeline_state: metal::RenderPipelineState,
+    glass_pipeline_state: metal::RenderPipelineState,
+    /// Blur pyramid: `GLASS_BLUR_LEVELS` levels down, then back up to 1/2.
+    glass_textures: Vec<metal::Texture>,
+    glass_textures_size: Size<DevicePixels>,
+    /// Glass samples the drawable, which a framebuffer-only layer forbids, so
+    /// the layer drops that optimisation only while a scene has glass.
+    framebuffer_only: bool,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -324,6 +337,28 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let glass_downsample_pipeline_state = build_glass_blur_pipeline_state(
+            &device,
+            &library,
+            "glass_downsample",
+            "glass_downsample_fragment",
+        );
+        let glass_upsample_pipeline_state = build_glass_blur_pipeline_state(
+            &device,
+            &library,
+            "glass_upsample",
+            "glass_upsample_fragment",
+        );
+        let glass_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "glass",
+            "glass_vertex",
+            "glass_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+
+        let framebuffer_only = layer.as_ref().is_some_and(|layer| layer.framebuffer_only());
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
@@ -345,6 +380,12 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            glass_downsample_pipeline_state,
+            glass_upsample_pipeline_state,
+            glass_pipeline_state,
+            glass_textures: Vec::new(),
+            glass_textures_size: Size::default(),
+            framebuffer_only,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -459,6 +500,13 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        // Test builds keep the layer readable for screenshots.
+        let framebuffer_only =
+            scene.glass.is_empty() && !cfg!(any(test, feature = "test-support"));
+        if framebuffer_only != self.framebuffer_only {
+            layer.set_framebuffer_only(framebuffer_only);
+            self.framebuffer_only = framebuffer_only;
+        }
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -739,12 +787,128 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::Glass(range) => {
+                    command_encoder.end_encoding();
+                    self.blur_for_glass(texture, viewport_size, command_buffer);
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                    self.draw_glass(&scene.glass[range], viewport_size, command_encoder);
+                }
             }
         }
 
         command_encoder.end_encoding();
 
         Ok(command_buffer.to_owned())
+    }
+
+    fn update_glass_textures(&mut self, size: Size<DevicePixels>) {
+        if self.glass_textures_size == size && !self.glass_textures.is_empty() {
+            return;
+        }
+        let level_size = |level: usize| {
+            let divisor = 2i32 << level;
+            (
+                (size.width.0 / divisor).max(1) as u64,
+                (size.height.0 / divisor).max(1) as u64,
+            )
+        };
+        // Down: 1/2 .. 1/2^LEVELS. Up: 1/2^(LEVELS-1) .. 1/2, finest last.
+        let sizes = (0..GLASS_BLUR_LEVELS)
+            .map(level_size)
+            .chain((0..GLASS_BLUR_LEVELS - 1).rev().map(level_size));
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        self.glass_textures = sizes
+            .map(|(width, height)| {
+                descriptor.set_width(width);
+                descriptor.set_height(height);
+                self.device.new_texture(&descriptor)
+            })
+            .collect();
+        self.glass_textures_size = size;
+    }
+
+    /// Blurs what has been drawn to `texture` so far into the pyramid.
+    fn blur_for_glass(
+        &mut self,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        self.update_glass_textures(viewport_size);
+        let mut source: &metal::TextureRef = texture;
+        for (index, target) in self.glass_textures.iter().enumerate() {
+            let pipeline = if index < GLASS_BLUR_LEVELS {
+                &self.glass_downsample_pipeline_state
+            } else {
+                &self.glass_upsample_pipeline_state
+            };
+            let descriptor = metal::RenderPassDescriptor::new();
+            let attachment = descriptor.color_attachments().object_at(0).unwrap();
+            attachment.set_texture(Some(target));
+            attachment.set_load_action(metal::MTLLoadAction::DontCare);
+            attachment.set_store_action(metal::MTLStoreAction::Store);
+            let encoder = command_buffer.new_render_command_encoder(descriptor);
+            encoder.set_render_pipeline_state(pipeline);
+            encoder.set_fragment_texture(0, Some(source));
+            let half_texel = [0.5 / target.width() as f32, 0.5 / target.height() as f32];
+            encoder.set_fragment_bytes(
+                0,
+                mem::size_of_val(&half_texel) as u64,
+                half_texel.as_ptr() as *const c_void,
+            );
+            encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+            encoder.end_encoding();
+            source = target;
+        }
+    }
+
+    fn draw_glass(
+        &self,
+        glass: &[Glass],
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        let Some(blurred) = self.glass_textures.last() else {
+            return;
+        };
+        command_encoder.set_render_pipeline_state(&self.glass_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            GlassInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_bytes(
+            GlassInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_bytes(
+            GlassInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(GlassInputIndex::Blurred as u64, Some(blurred));
+        for chunk in glass.chunks(GLASS_PER_DRAW) {
+            let bytes = mem::size_of_val(chunk) as u64;
+            let data = chunk.as_ptr() as *const c_void;
+            command_encoder.set_vertex_bytes(GlassInputIndex::Glass as u64, bytes, data);
+            command_encoder.set_fragment_bytes(GlassInputIndex::Glass as u64, bytes, data);
+            command_encoder.draw_primitives_instanced(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6,
+                chunk.len() as u64,
+            );
+        }
     }
 
     fn draw_paths_to_intermediate(
@@ -1341,6 +1505,33 @@ fn build_path_sprite_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+/// Blur passes overwrite their target, so they don't blend.
+fn build_glass_blur_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    fragment_fn_name: &str,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function("glass_blur_vertex", None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_path_rasterization_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -1578,6 +1769,14 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+}
+
+#[repr(C)]
+enum GlassInputIndex {
+    Vertices = 0,
+    Glass = 1,
+    ViewportSize = 2,
+    Blurred = 3,
 }
 
 #[repr(C)]

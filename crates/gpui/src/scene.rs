@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub glass: Vec<Glass>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.glass.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +135,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Glass(glass) => {
+                glass.order = order;
+                self.glass.push(*glass);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +166,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.glass.sort_by_key(|glass| glass.order);
     }
 
     #[cfg_attr(
@@ -187,6 +194,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            glass_start: 0,
+            glass_iter: self.glass.iter().peekable(),
         }
     }
 }
@@ -209,6 +218,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Glass,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +238,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Glass(Glass),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +253,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Glass(glass) => &glass.bounds,
         }
     }
 
@@ -255,6 +267,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Glass(glass) => &glass.content_mask,
         }
     }
 }
@@ -283,6 +296,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    glass_start: usize,
+    glass_iter: Peekable<slice::Iter<'a, Glass>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -316,6 +331,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
             ),
+            (self.glass_iter.peek().map(|g| g.order), PrimitiveKind::Glass),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -461,6 +477,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Glass => {
+                // One batch per run of glass: the renderer blurs what is below
+                // it once and draws every shape in the batch from that blur.
+                let glass_start = self.glass_start;
+                let mut glass_end = glass_start + 1;
+                self.glass_iter.next();
+                while self
+                    .glass_iter
+                    .next_if(|glass| (glass.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    glass_end += 1;
+                }
+                self.glass_start = glass_end;
+                Some(PrimitiveBatch::Glass(glass_start..glass_end))
+            }
         }
     }
 }
@@ -493,6 +525,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    Glass(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +558,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::Glass(range) => format!("glass ({})", range.len()),
         }
     }
 }
@@ -760,6 +794,38 @@ pub struct PolychromeSprite {
 impl From<PolychromeSprite> for Primitive {
     fn from(sprite: PolychromeSprite) -> Self {
         Primitive::PolychromeSprite(sprite)
+    }
+}
+
+/// A rounded shape that refracts and frosts whatever the scene drew beneath it.
+///
+/// Renderers without a glass pass draw it as a flat tint.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct Glass {
+    /// Set by the scene.
+    pub order: DrawOrder,
+    /// Keeps `bounds` 8-byte aligned for the GPU.
+    pub pad: u32,
+    /// Shape bounds, in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip rectangle, in device pixels.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// One radius for all corners; half the height makes a capsule.
+    pub corner_radius: ScaledPixels,
+    /// Width of the bent band along the edge, in device pixels.
+    pub bezel: ScaledPixels,
+    /// How far the edge band shifts what it samples, in device pixels.
+    pub refraction: ScaledPixels,
+    /// Rim highlight strength, 0 to 1.
+    pub rim: f32,
+    /// Tint mixed over the blurred content; alpha is the mix amount.
+    pub tint: Hsla,
+}
+
+impl From<Glass> for Primitive {
+    fn from(glass: Glass) -> Self {
+        Primitive::Glass(glass)
     }
 }
 

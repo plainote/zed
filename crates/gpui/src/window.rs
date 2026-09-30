@@ -4890,6 +4890,38 @@ impl Window {
         });
     }
 
+    /// Paint a glass shape: it frosts and refracts everything painted before it
+    /// that lies beneath it. Paint its contents afterwards.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glass(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radius: Pixels,
+        bezel: Pixels,
+        refraction: Pixels,
+        rim: f32,
+        tint: Hsla,
+    ) {
+        use crate::Glass;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(Glass {
+            order: 0,
+            pad: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radius: corner_radius.scale(scale_factor),
+            bezel: bezel.scale(scale_factor),
+            refraction: refraction.scale(scale_factor),
+            rim: rim * opacity,
+            tint: tint.opacity(opacity),
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

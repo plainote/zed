@@ -1529,6 +1529,8 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // No glass pass here yet (L0-10 fork is Metal only).
+                    PrimitiveBatch::Glass(_glass) => {}
                 }
             }
         }

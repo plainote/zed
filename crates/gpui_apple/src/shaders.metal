@@ -1277,3 +1277,137 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+// Glass (Vesper L0-10 spike). The renderer blurs everything drawn before a
+// glass batch into a half-resolution dual-Kawase pyramid, then draws each
+// glass shape by sampling the blur through a lens that bends its edge band.
+
+struct GlassBlurVertexOutput {
+  float4 position [[position]];
+  float2 uv;
+};
+
+// One triangle that covers the whole target.
+vertex GlassBlurVertexOutput glass_blur_vertex(uint vertex_id [[vertex_id]]) {
+  float2 uv = float2((vertex_id << 1) & 2, vertex_id & 2);
+  GlassBlurVertexOutput output;
+  output.position = float4(uv * float2(2., -2.) + float2(-1., 1.), 0., 1.);
+  output.uv = uv;
+  return output;
+}
+
+// `half_texel` is half a texel of the target, in source UV.
+fragment float4 glass_downsample_fragment(GlassBlurVertexOutput input [[stage_in]],
+                                          texture2d<float> source [[texture(0)]],
+                                          constant float2 *half_texel [[buffer(0)]]) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  float2 o = *half_texel;
+  float4 sum = source.sample(s, input.uv) * 4.;
+  sum += source.sample(s, input.uv - o);
+  sum += source.sample(s, input.uv + o);
+  sum += source.sample(s, input.uv + float2(o.x, -o.y));
+  sum += source.sample(s, input.uv - float2(o.x, -o.y));
+  return sum / 8.;
+}
+
+fragment float4 glass_upsample_fragment(GlassBlurVertexOutput input [[stage_in]],
+                                        texture2d<float> source [[texture(0)]],
+                                        constant float2 *half_texel [[buffer(0)]]) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  float2 o = *half_texel;
+  float4 sum = source.sample(s, input.uv + float2(-o.x * 2., 0.));
+  sum += source.sample(s, input.uv + float2(-o.x, o.y)) * 2.;
+  sum += source.sample(s, input.uv + float2(0., o.y * 2.));
+  sum += source.sample(s, input.uv + float2(o.x, o.y)) * 2.;
+  sum += source.sample(s, input.uv + float2(o.x * 2., 0.));
+  sum += source.sample(s, input.uv + float2(o.x, -o.y)) * 2.;
+  sum += source.sample(s, input.uv + float2(0., -o.y * 2.));
+  sum += source.sample(s, input.uv + float2(-o.x, -o.y)) * 2.;
+  return sum / 12.;
+}
+
+struct GlassVertexOutput {
+  uint glass_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct GlassFragmentInput {
+  uint glass_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex GlassVertexOutput glass_vertex(uint unit_vertex_id [[vertex_id]],
+                                      uint glass_id [[instance_id]],
+                                      constant float2 *unit_vertices
+                                      [[buffer(GlassInputIndex_Vertices)]],
+                                      constant Glass *glass
+                                      [[buffer(GlassInputIndex_Glass)]],
+                                      constant Size_DevicePixels *viewport_size
+                                      [[buffer(GlassInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  Glass g = glass[glass_id];
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, g.bounds, g.content_mask.bounds);
+  GlassVertexOutput output;
+  output.glass_id = glass_id;
+  output.position = to_device_position(unit_vertex, g.bounds, viewport_size);
+  output.clip_distance[0] = clip_distance.x;
+  output.clip_distance[1] = clip_distance.y;
+  output.clip_distance[2] = clip_distance.z;
+  output.clip_distance[3] = clip_distance.w;
+  return output;
+}
+
+fragment float4 glass_fragment(GlassFragmentInput input [[stage_in]],
+                               constant Glass *glass [[buffer(GlassInputIndex_Glass)]],
+                               constant Size_DevicePixels *viewport_size
+                               [[buffer(GlassInputIndex_ViewportSize)]],
+                               texture2d<float> blurred
+                               [[texture(GlassInputIndex_Blurred)]]) {
+  constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+  Glass g = glass[input.glass_id];
+
+  float2 p = input.position.xy;
+  float2 half_size = float2(g.bounds.size.width, g.bounds.size.height) * 0.5;
+  float2 center = float2(g.bounds.origin.x, g.bounds.origin.y) + half_size;
+  float radius = min(g.corner_radius, min(half_size.x, half_size.y));
+  float2 rel = p - center;
+  float2 q = abs(rel) - (half_size - radius);
+  // Signed distance to the rounded rectangle; negative inside.
+  float d = length(max(q, 0.)) + min(max(q.x, q.y), 0.) - radius;
+  float coverage = saturate(0.5 - d);
+  if (coverage <= 0.) {
+    discard_fragment();
+  }
+
+  // Outward normal of the nearest edge.
+  float2 n = (q.x > 0. && q.y > 0.) ? normalize(q)
+             : (q.x > q.y ? float2(1., 0.) : float2(0., 1.));
+  n *= select(float2(-1.), float2(1.), rel >= 0.);
+
+  // 1 on the rim, 0 once past the bezel; a circular profile, like a lens edge.
+  float edge = saturate(1. + d / max(g.bezel, 1.));
+  float bend = 1. - sqrt(saturate(1. - edge * edge));
+
+  float2 viewport = float2(viewport_size->width, viewport_size->height);
+  float2 offset = -n * bend * g.refraction;
+  float2 uv = (p + offset) / viewport;
+  // A little dispersion along the edge.
+  float2 dispersion = -n * bend * 0.12 * g.refraction / viewport;
+  float3 color = float3(blurred.sample(s, uv + dispersion).r,
+                        blurred.sample(s, uv).g,
+                        blurred.sample(s, uv - dispersion).b);
+
+  float4 tint = hsla_to_rgba(g.tint);
+  color = mix(color, tint.rgb, tint.a);
+
+  // Rim light from the top left: a hairline plus a soft glow inside the bezel.
+  float facing = dot(n, normalize(float2(-0.45, -1.)));
+  float hairline = saturate(1. + d / 1.5);
+  float glow = edge * edge * edge;
+  color += g.rim * (hairline * (0.25 + 0.5 * abs(facing)) +
+                    glow * 0.18 * max(facing, 0.));
+
+  return float4(saturate(color), coverage);
+}

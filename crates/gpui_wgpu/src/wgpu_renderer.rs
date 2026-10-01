@@ -2,7 +2,7 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+    AtlasTextureId, Background, Bounds, DevicePixels, Glass, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
@@ -41,6 +41,30 @@ const SUBPIXEL_SHADERS: &str = concat!(
     include_str!("shaders_storage.wgsl"),
     include_str!("shaders_subpixel.wgsl"),
 );
+
+/// Glass (Vesper L0-14): the blur and lens passes. They read instances from a
+/// storage buffer, so WebGL2 draws glass as a flat tint instead.
+const GLASS_SHADERS: &str = concat!(
+    include_str!("shaders.wgsl"),
+    include_str!("shaders_storage.wgsl"),
+    include_str!("shaders_glass.wgsl"),
+);
+
+/// Levels in the glass blur pyramid: 1/2, 1/4, 1/8 and 1/16 of the frame.
+const GLASS_BLUR_LEVELS: usize = 4;
+
+/// How the glass pass reads what is under it. Backends differ in what a
+/// surface texture allows: Vulkan drivers usually let it be sampled, Metal and
+/// DX12 in wgpu only let it be copied, and GL allows neither.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlassSource {
+    /// Sample the frame directly.
+    Sample,
+    /// Copy the frame to a texture first, then sample that.
+    Copy,
+    /// Draw glass as a flat tint.
+    None,
+}
 
 fn least_common_multiple(left: u64, right: u64) -> u64 {
     let mut first = left;
@@ -132,6 +156,9 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    glass_downsample: wgpu::RenderPipeline,
+    glass_upsample: wgpu::RenderPipeline,
+    glass: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -192,6 +219,14 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// Blur pyramid: `GLASS_BLUR_LEVELS` levels down, then back up to 1/2.
+    /// Created on the first frame with glass.
+    glass_views: Vec<wgpu::TextureView>,
+    /// The frame, copied, when the surface can't be sampled directly.
+    glass_copy: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// Bound instead of the pyramid when the surface can't be read at all;
+    /// the shader then draws a flat tint.
+    glass_fallback_view: wgpu::TextureView,
 }
 
 impl WgpuResources {
@@ -200,6 +235,8 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.glass_views.clear();
+        self.glass_copy = None;
     }
 }
 
@@ -231,6 +268,7 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    glass_source: GlassSource,
 }
 
 impl WgpuRenderer {
@@ -411,8 +449,30 @@ impl WgpuRenderer {
             );
         }
 
+        let uses_webgl_instance_data = context.uses_webgl_instance_data();
+        // The glass pass reads the frame it draws into. The extra usage is
+        // requested on every frame; whether that costs a driver a fast path
+        // (as `framebufferOnly` does on Metal) is not measured here.
+        let glass_source = if uses_webgl_instance_data {
+            GlassSource::None
+        } else if surface_caps
+            .usages
+            .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        {
+            GlassSource::Sample
+        } else if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            GlassSource::Copy
+        } else {
+            GlassSource::None
+        };
+        let surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | match glass_source {
+                GlassSource::Sample => wgpu::TextureUsages::TEXTURE_BINDING,
+                GlassSource::Copy => wgpu::TextureUsages::COPY_SRC,
+                GlassSource::None => wgpu::TextureUsages::empty(),
+            };
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -430,7 +490,6 @@ impl WgpuRenderer {
 
         let queue = Arc::clone(&context.queue);
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
-        let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
         let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
@@ -561,6 +620,23 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
+        let glass_fallback_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("glass_fallback"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: surface_format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         let resources = WgpuResources {
             device,
             queue,
@@ -578,6 +654,9 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            glass_views: Vec::new(),
+            glass_copy: None,
+            glass_fallback_view,
         };
 
         Ok(Self {
@@ -604,6 +683,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            glass_source,
         })
     }
 
@@ -1049,10 +1129,77 @@ impl WgpuRenderer {
             &layouts.surfaces,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            &[Some(color_target.clone())],
             1,
             &shader_module,
         );
+
+        // WebGL2 has no storage buffers, so it never compiles the glass module.
+        let glass_module_storage;
+        let glass_module = if uses_webgl_instance_data {
+            &shader_module
+        } else {
+            glass_module_storage = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("gpui_glass_shaders"),
+                source: wgpu::ShaderSource::Wgsl(GLASS_SHADERS.into()),
+            });
+            &glass_module_storage
+        };
+        // Blur passes overwrite their target, so they don't blend, and they
+        // bind only the source texture (group 2).
+        let blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("glass_blur_layout"),
+            bind_group_layouts: &[None, None, Some(&layouts.texture)],
+            immediate_size: 0,
+        });
+        let create_blur_pipeline = |name: &str, fs_entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(name),
+                layout: Some(&blur_layout),
+                vertex: wgpu::VertexState {
+                    module: glass_module,
+                    entry_point: Some("vs_glass_blur"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: glass_module,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let (glass_downsample, glass_upsample, glass) = if uses_webgl_instance_data {
+            // Never drawn: `record_frame` skips glass on WebGL2.
+            (surfaces.clone(), surfaces.clone(), surfaces.clone())
+        } else {
+            (
+                create_blur_pipeline("glass_downsample", "fs_glass_downsample"),
+                create_blur_pipeline("glass_upsample", "fs_glass_upsample"),
+                create_pipeline(
+                    "glass",
+                    "vs_glass",
+                    "fs_glass",
+                    &layouts.globals,
+                    &layouts.instances,
+                    Some(&layouts.texture),
+                    wgpu::PrimitiveTopology::TriangleStrip,
+                    &[Some(color_target)],
+                    1,
+                    glass_module,
+                ),
+            )
+        };
 
         WgpuPipelines {
             quads,
@@ -1064,6 +1211,9 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            glass_downsample,
+            glass_upsample,
+            glass,
         }
     }
 
@@ -1392,7 +1542,7 @@ impl WgpuRenderer {
             );
         }
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
+        if let Err(error) = self.record_frame(scene, &frame.texture, &frame_view) {
             log::error!("{error:#}");
             self.resources().queue.submit(std::iter::empty());
             return false;
@@ -1402,7 +1552,12 @@ impl WgpuRenderer {
         true
     }
 
-    fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+    fn record_frame(
+        &mut self,
+        scene: &Scene,
+        frame: &wgpu::Texture,
+        frame_view: &wgpu::TextureView,
+    ) -> Result<()> {
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1529,8 +1684,30 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    // No glass pass here yet (L0-10 fork is Metal only).
-                    PrimitiveBatch::Glass(_glass) => {}
+                    PrimitiveBatch::Glass(range) => {
+                        if self.uses_webgl_instance_data {
+                            continue;
+                        }
+                        drop(pass);
+                        if self.glass_source != GlassSource::None {
+                            self.blur_for_glass(&mut encoder, frame, frame_view);
+                        }
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_after_glass_blur"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: frame_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        self.draw_glass(&scene.glass[range], &mut instance_offset, &mut pass)?;
+                    }
                 }
             }
         }
@@ -1698,6 +1875,134 @@ impl WgpuRenderer {
             0..4,
             instances.first_instance..instances.first_instance + sprites.len() as u32,
         );
+        Ok(())
+    }
+
+    fn ensure_glass_textures(&mut self) {
+        let format = self.surface_config.format;
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        if self.glass_source == GlassSource::Copy && self.resources().glass_copy.is_none() {
+            let resources = self.resources_mut();
+            let texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("glass_copy"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            resources.glass_copy = Some((texture, view));
+        }
+        if !self.resources().glass_views.is_empty() {
+            return;
+        }
+        let level_size = |level: usize| {
+            let divisor = 2u32 << level;
+            ((width / divisor).max(1), (height / divisor).max(1))
+        };
+        // Down: 1/2 .. 1/2^LEVELS. Up: 1/2^(LEVELS-1) .. 1/2, finest last.
+        let sizes = (0..GLASS_BLUR_LEVELS)
+            .map(level_size)
+            .chain((0..GLASS_BLUR_LEVELS - 1).rev().map(level_size));
+        let resources = self.resources_mut();
+        resources.glass_views = sizes
+            .map(|(width, height)| {
+                resources
+                    .device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("glass_blur"),
+                        size: wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            })
+            .collect();
+    }
+
+    /// Blurs what has been drawn to the frame so far into the pyramid.
+    fn blur_for_glass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::Texture,
+        frame_view: &wgpu::TextureView,
+    ) {
+        self.ensure_glass_textures();
+        let resources = self.resources();
+        let mut source = frame_view;
+        if let Some((copy, copy_view)) = &resources.glass_copy {
+            encoder.copy_texture_to_texture(
+                frame.as_image_copy(),
+                copy.as_image_copy(),
+                copy.size(),
+            );
+            source = copy_view;
+        }
+        for (index, target) in resources.glass_views.iter().enumerate() {
+            let pipeline = if index < GLASS_BLUR_LEVELS {
+                &resources.pipelines.glass_downsample
+            } else {
+                &resources.pipelines.glass_upsample
+            };
+            let texture = self.create_texture_bind_group("glass_blur_source", source);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("glass_blur_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(2, &texture, &[]);
+            pass.draw(0..3, 0..1);
+            source = target;
+        }
+    }
+
+    fn draw_glass(
+        &mut self,
+        glass: &[Glass],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        let instances = self.write_instance_binding("glass_bind_group", instance_offset, glass)?;
+        let resources = self.resources();
+        let blurred = match self.glass_source {
+            GlassSource::None => None,
+            _ => resources.glass_views.last(),
+        };
+        let texture = self.create_texture_bind_group(
+            "glass_blurred",
+            blurred.unwrap_or(&resources.glass_fallback_view),
+        );
+        pass.set_pipeline(&resources.pipelines.glass);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &instances.bind_group, &[]);
+        pass.set_bind_group(2, &texture, &[]);
+        pass.draw(0..4, 0..glass.len() as u32);
         Ok(())
     }
 
@@ -2214,6 +2519,13 @@ mod tests {
     #[test]
     fn storage_buffer_shader_is_valid_wgsl() {
         validate_wgsl(STORAGE_BUFFER_SHADERS, naga::valid::Capabilities::empty());
+    }
+
+    #[test]
+    fn glass_shader_is_valid_wgsl() {
+        validate_wgsl(GLASS_SHADERS, naga::valid::Capabilities::empty());
+        // The shader's `Glass` struct is 18 words with 8-byte alignment.
+        assert_eq!(std::mem::size_of::<Glass>(), 18 * 4);
     }
 
     #[test]

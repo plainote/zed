@@ -847,7 +847,7 @@ pub struct GlassStyle {
     pub fuse: Pixels,
     /// Colour fringe along the edge, as a fraction of `refraction`.
     pub dispersion: f32,
-    /// 0 is clear (a light blur), 1 fully frosted. wgpu always draws 1 for now.
+    /// 0 is clear (a light blur), 1 fully frosted. Metal and wgpu; Direct3D has no pass.
     pub frost: f32,
 }
 

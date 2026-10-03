@@ -1186,18 +1186,44 @@ impl WgpuRenderer {
             (
                 create_blur_pipeline("glass_downsample", "fs_glass_downsample"),
                 create_blur_pipeline("glass_upsample", "fs_glass_upsample"),
-                create_pipeline(
-                    "glass",
-                    "vs_glass",
-                    "fs_glass",
-                    &layouts.globals,
-                    &layouts.instances,
-                    Some(&layouts.texture),
-                    wgpu::PrimitiveTopology::TriangleStrip,
-                    &[Some(color_target)],
-                    1,
-                    glass_module,
-                ),
+                {
+                    // Group 2 is the full blur; group 3 the first, lightly blurred
+                    // level, for clear glass (frost below 1).
+                    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("glass_layout"),
+                        bind_group_layouts: &[
+                            Some(&layouts.globals),
+                            Some(&layouts.instances),
+                            Some(&layouts.texture),
+                            Some(&layouts.texture),
+                        ],
+                        immediate_size: 0,
+                    });
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("glass"),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module: glass_module,
+                            entry_point: Some("vs_glass"),
+                            buffers: &[],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: glass_module,
+                            entry_point: Some("fs_glass"),
+                            targets: &[Some(color_target)],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleStrip,
+                            ..Default::default()
+                        },
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
+                    })
+                },
             )
         };
 
@@ -1994,14 +2020,23 @@ impl WgpuRenderer {
             GlassSource::None => None,
             _ => resources.glass_views.last(),
         };
+        let light = match self.glass_source {
+            GlassSource::None => None,
+            _ => resources.glass_views.first(),
+        };
         let texture = self.create_texture_bind_group(
             "glass_blurred",
             blurred.unwrap_or(&resources.glass_fallback_view),
+        );
+        let light = self.create_texture_bind_group(
+            "glass_light",
+            light.unwrap_or(&resources.glass_fallback_view),
         );
         pass.set_pipeline(&resources.pipelines.glass);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
+        pass.set_bind_group(3, &light, &[]);
         pass.draw(0..4, 0..glass.len() as u32);
         Ok(())
     }

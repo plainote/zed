@@ -15,12 +15,15 @@ struct Glass {
     rim: f32,
     tint: Hsla,
     dispersion: f32,
-    // wgpu draws fully frosted for now: clear glass needs a second texture binding.
+    // 0 samples the first, lightly blurred pyramid level (t_light), 1 the full blur.
     frost: f32,
     pad2: vec2<u32>,
 }
 
 @group(1) @binding(0) var<storage, read> b_glass: array<Glass>;
+// The first pyramid level, for clear (unfrosted) glass. Only fs_glass uses it.
+@group(3) @binding(0) var t_light: texture_2d<f32>;
+@group(3) @binding(1) var s_light: sampler;
 
 struct GlassBlurVarying {
     @builtin(position) position: vec4<f32>,
@@ -124,11 +127,17 @@ fn fs_glass(input: GlassVarying) -> @location(0) vec4<f32> {
     let uv = (p + offset) / viewport;
     // A little dispersion along the edge.
     let dispersion = -n * bend * g.dispersion * g.refraction / viewport;
-    var color = vec3<f32>(
+    let frosted = vec3<f32>(
         textureSampleLevel(t_sprite, s_sprite, uv + dispersion, 0.0).r,
         textureSampleLevel(t_sprite, s_sprite, uv, 0.0).g,
         textureSampleLevel(t_sprite, s_sprite, uv - dispersion, 0.0).b,
     );
+    let clear = vec3<f32>(
+        textureSampleLevel(t_light, s_light, uv + dispersion, 0.0).r,
+        textureSampleLevel(t_light, s_light, uv, 0.0).g,
+        textureSampleLevel(t_light, s_light, uv - dispersion, 0.0).b,
+    );
+    var color = mix(clear, frosted, clamp(g.frost, 0.0, 1.0));
 
     color = mix(color, tint.rgb, tint.a);
 

@@ -1438,7 +1438,9 @@ fragment float4 glass_fragment(GlassFragmentInput input [[stage_in]],
                                texture2d<float> blurred
                                [[texture(GlassInputIndex_Blurred)]],
                                constant uint *count
-                               [[buffer(GlassInputIndex_Count)]]) {
+                               [[buffer(GlassInputIndex_Count)]],
+                               texture2d<float> light
+                               [[texture(GlassInputIndex_Light)]]) {
   constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
   Glass g = glass[input.glass_id];
 
@@ -1477,11 +1479,16 @@ fragment float4 glass_fragment(GlassFragmentInput input [[stage_in]],
   float2 viewport = float2(viewport_size->width, viewport_size->height);
   float2 offset = -n * bend * g.refraction;
   float2 uv = (p + offset) / viewport;
-  // A little dispersion along the edge.
-  float2 dispersion = -n * bend * 0.12 * g.refraction / viewport;
-  float3 color = float3(blurred.sample(s, uv + dispersion).r,
-                        blurred.sample(s, uv).g,
-                        blurred.sample(s, uv - dispersion).b);
+  // A colour fringe along the edge, as a fraction of the refraction.
+  float2 dispersion = -n * bend * g.dispersion * g.refraction / viewport;
+  float3 frosted = float3(blurred.sample(s, uv + dispersion).r,
+                          blurred.sample(s, uv).g,
+                          blurred.sample(s, uv - dispersion).b);
+  // Clear glass samples the first, lightly blurred pyramid level instead.
+  float3 clear = float3(light.sample(s, uv + dispersion).r,
+                        light.sample(s, uv).g,
+                        light.sample(s, uv - dispersion).b);
+  float3 color = mix(clear, frosted, saturate(g.frost));
 
   float4 tint = hsla_to_rgba(g.tint);
   color = mix(color, tint.rgb, tint.a);

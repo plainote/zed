@@ -821,6 +821,50 @@ pub struct Glass {
     pub rim: f32,
     /// Tint mixed over the blurred content; alpha is the mix amount.
     pub tint: Hsla,
+    /// Colour fringe along the edge, as a fraction of `refraction` (0 to 1).
+    pub dispersion: f32,
+    /// How frosted the glass is: 0 samples a lightly blurred frame, 1 the full blur.
+    pub frost: f32,
+    /// Keeps the struct a multiple of 16 bytes for GPU storage arrays.
+    pub pad2: [u32; 2],
+}
+
+/// Everything `Window::paint_glass_styled` needs. The defaults match `paint_glass`.
+#[derive(Debug, Copy, Clone)]
+pub struct GlassStyle {
+    /// One radius for all corners; half the height makes a capsule.
+    pub corner_radius: Pixels,
+    /// Width of the edge band that bends.
+    pub bezel: Pixels,
+    /// How far the edge band shifts what it samples.
+    pub refraction: Pixels,
+    /// Rim highlight strength, 0 to 1.
+    pub rim: f32,
+    /// Mixed over the blurred content; alpha is the mix amount.
+    pub tint: Hsla,
+    /// Shapes with the same nonzero group fuse within `fuse` (Metal only).
+    pub group: u8,
+    pub fuse: Pixels,
+    /// Colour fringe along the edge, as a fraction of `refraction`.
+    pub dispersion: f32,
+    /// 0 is clear (a light blur), 1 fully frosted. wgpu always draws 1 for now.
+    pub frost: f32,
+}
+
+impl Default for GlassStyle {
+    fn default() -> Self {
+        Self {
+            corner_radius: Pixels::ZERO,
+            bezel: crate::px(18.),
+            refraction: crate::px(14.),
+            rim: 0.6,
+            tint: crate::transparent_black(),
+            group: 0,
+            fuse: Pixels::ZERO,
+            dispersion: 0.12,
+            frost: 1.,
+        }
+    }
 }
 
 impl From<Glass> for Primitive {

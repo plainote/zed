@@ -897,6 +897,10 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
         command_encoder.set_fragment_texture(GlassInputIndex::Blurred as u64, Some(blurred));
+        command_encoder.set_fragment_texture(
+            GlassInputIndex::Light as u64,
+            self.glass_textures.first().map(|t| t.as_ref()),
+        );
         for chunk in glass.chunks(GLASS_PER_DRAW) {
             let bytes = mem::size_of_val(chunk) as u64;
             let data = chunk.as_ptr() as *const c_void;
@@ -1783,6 +1787,8 @@ enum GlassInputIndex {
     Blurred = 3,
     /// Spike L1-26: shapes in this draw, so fused groups can find each other.
     Count = 4,
+    /// The first, lightly blurred pyramid level, for clear (unfrosted) glass.
+    Light = 5,
 }
 
 #[repr(C)]

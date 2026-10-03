@@ -14,6 +14,10 @@ struct Glass {
     refraction: f32,
     rim: f32,
     tint: Hsla,
+    dispersion: f32,
+    // wgpu draws fully frosted for now: clear glass needs a second texture binding.
+    frost: f32,
+    pad2: vec2<u32>,
 }
 
 @group(1) @binding(0) var<storage, read> b_glass: array<Glass>;
@@ -119,7 +123,7 @@ fn fs_glass(input: GlassVarying) -> @location(0) vec4<f32> {
     let offset = -n * bend * g.refraction;
     let uv = (p + offset) / viewport;
     // A little dispersion along the edge.
-    let dispersion = -n * bend * 0.12 * g.refraction / viewport;
+    let dispersion = -n * bend * g.dispersion * g.refraction / viewport;
     var color = vec3<f32>(
         textureSampleLevel(t_sprite, s_sprite, uv + dispersion, 0.0).r,
         textureSampleLevel(t_sprite, s_sprite, uv, 0.0).g,

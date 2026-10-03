@@ -4906,10 +4906,10 @@ impl Window {
         self.paint_glass_fused(bounds, corner_radius, bezel, refraction, rim, tint, 0, px(0.));
     }
 
-    /// Spike L1-26: like `paint_glass`, but shapes painted with the same nonzero
-    /// `group` melt together where they come within `fuse` of each other, like drops
-    /// of liquid (a smooth union of their distance fields). The first shape of a group
-    /// supplies the lens, rim and tint for all of them. Groups 1 to 255.
+    /// Like `paint_glass`, but shapes painted with the same nonzero `group` melt
+    /// together where they come within `fuse` of each other, like drops of liquid (a
+    /// smooth union of their distance fields). The first shape of a group supplies the
+    /// lens, rim and tint for all of them. Groups 1 to 255.
     #[allow(clippy::too_many_arguments)]
     pub fn paint_glass_fused(
         &mut self,
@@ -4922,7 +4922,36 @@ impl Window {
         group: u8,
         fuse: Pixels,
     ) {
+        self.paint_glass_styled(
+            bounds,
+            &crate::GlassStyle {
+                corner_radius,
+                bezel,
+                refraction,
+                rim,
+                tint,
+                group,
+                fuse,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Paint a glass shape with every parameter, including the colour fringe at its
+    /// edge and how frosted it is.
+    pub fn paint_glass_styled(&mut self, bounds: Bounds<Pixels>, style: &crate::GlassStyle) {
         use crate::Glass;
+        let crate::GlassStyle {
+            corner_radius,
+            bezel,
+            refraction,
+            rim,
+            tint,
+            group,
+            fuse,
+            dispersion,
+            frost,
+        } = *style;
 
         self.invalidator.debug_assert_paint();
 
@@ -4942,6 +4971,9 @@ impl Window {
             refraction: refraction.scale(scale_factor),
             rim: rim * opacity,
             tint: tint.opacity(opacity),
+            dispersion: dispersion.clamp(0., 1.),
+            frost: frost.clamp(0., 1.),
+            pad2: [0; 2],
         });
     }
 

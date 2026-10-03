@@ -1,5 +1,5 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
+    A11yCallbacks, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
@@ -58,6 +58,8 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    a11y_callbacks: Option<A11yCallbacks>,
+    a11y_tree: Option<accesskit::TreeUpdate>,
 }
 
 #[derive(Clone)]
@@ -132,6 +134,8 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            a11y_callbacks: None,
+            a11y_tree: None,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -208,6 +212,36 @@ impl TestWindow {
 
     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
         self.0.lock().text_input_state_changes.clone()
+    }
+
+    /// Simulates a screen reader connecting. Like a real adapter, this returns
+    /// a placeholder tree at once, and the window sends the full tree with its
+    /// next frame.
+    pub fn simulate_a11y_activation(&self) {
+        let mut lock = self.0.lock();
+        let tree = lock.a11y_callbacks.as_ref().and_then(|c| (c.activation)());
+        if tree.is_some() {
+            lock.a11y_tree = tree;
+        }
+    }
+
+    /// Simulates a screen reader disconnecting.
+    pub fn simulate_a11y_deactivation(&self) {
+        if let Some(callbacks) = self.0.lock().a11y_callbacks.as_ref() {
+            (callbacks.deactivation)();
+        }
+    }
+
+    /// Simulates a screen reader requesting an action on a node.
+    pub fn simulate_a11y_action(&self, request: accesskit::ActionRequest) {
+        if let Some(callbacks) = self.0.lock().a11y_callbacks.as_ref() {
+            (callbacks.action)(request);
+        }
+    }
+
+    /// The last tree update sent to the accessibility adapter.
+    pub fn a11y_tree(&self) -> Option<accesskit::TreeUpdate> {
+        self.0.lock().a11y_tree.clone()
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -292,6 +326,14 @@ impl TestWindow {
 }
 
 impl PlatformWindow for TestWindow {
+    fn a11y_init(&self, callbacks: A11yCallbacks) {
+        self.0.lock().a11y_callbacks = Some(callbacks);
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        self.0.lock().a11y_tree = Some(tree_update);
+    }
+
     fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
         let state = self.0.lock();
         state

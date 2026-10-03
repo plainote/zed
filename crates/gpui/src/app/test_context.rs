@@ -963,6 +963,26 @@ impl VisualTestContext {
         })
     }
 
+    /// Simulates a screen reader connecting, then runs until parked so the
+    /// window has sent its full tree.
+    pub fn simulate_a11y_activation(&mut self) {
+        self.cx.test_window(self.window).simulate_a11y_activation();
+        self.run_until_parked();
+    }
+
+    /// Simulates a screen reader requesting an action, then runs until parked.
+    pub fn simulate_a11y_action(&mut self, request: accesskit::ActionRequest) {
+        self.cx
+            .test_window(self.window)
+            .simulate_a11y_action(request);
+        self.run_until_parked();
+    }
+
+    /// The last tree update the window sent to the accessibility adapter.
+    pub fn a11y_tree(&self) -> Option<accesskit::TreeUpdate> {
+        self.cx.test_window(self.window).a11y_tree()
+    }
+
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_resize(&self, size: Size<Pixels>) {
         self.simulate_window_resize(self.window, size)

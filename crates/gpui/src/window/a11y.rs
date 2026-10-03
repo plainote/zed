@@ -356,6 +356,44 @@ impl<'a> A11ySubtreeBuilder<'a> {
         pushed
     }
 
+    /// Add a synthetic node that is not a direct child of this element's node,
+    /// so a synthetic child can hold a whole subtree. Another node pushed here
+    /// (or with [`Self::push_child`]) must list `id` among its children.
+    ///
+    /// Returns `false` if a node with this id is already present in the tree,
+    /// in which case the node is discarded.
+    pub fn push_descendant(&mut self, id: NodeId, node: accesskit::Node) -> bool {
+        let pushed = self.nodes.push_detached(id, node);
+        #[cfg(debug_assertions)]
+        if pushed {
+            self.nodes.record_node_info(
+                id,
+                debug::NodeDebugInfo {
+                    synthetic: true,
+                    view: self.creator.view,
+                    element_id: self.creator.element_id.clone(),
+                    source_location: self.creator.source_location,
+                },
+            );
+        }
+        pushed
+    }
+
+    /// Report a synthetic node as the active descendant, which assistive
+    /// technology then treats as focused, as
+    /// [`StatefulInteractiveElement::aria_active_descendant`] does for real
+    /// elements. `id` must have been pushed in this frame.
+    ///
+    /// Call this only while keyboard focus is inside this element. Unlike the
+    /// real-element version, it doesn't require the focused element to have a
+    /// node of its own: an element that draws its content itself often tracks
+    /// focus on a plain container.
+    pub fn set_active_descendant(&mut self, id: NodeId) {
+        if self.nodes.has_node(id) {
+            self.nodes.set_active_descendant(id);
+        }
+    }
+
     /// A mutable reference to the parent node.
     pub fn parent_node(&mut self) -> &mut accesskit::Node {
         self.nodes
@@ -447,6 +485,18 @@ impl A11yNodeBuilder {
 
         if let Some(parent) = self.nodes_stack.last_mut() {
             parent.push_child(id);
+        }
+        self.all_nodes.push((id, node));
+        true
+    }
+
+    /// Add a node without making it a child of the top-of-stack node; another
+    /// node lists it as a child.
+    ///
+    /// Returns `true` if the node was successfully pushed.
+    pub(crate) fn push_detached(&mut self, id: NodeId, node: accesskit::Node) -> bool {
+        if !self.can_push(id) {
+            return false;
         }
         self.all_nodes.push((id, node));
         true
@@ -633,7 +683,7 @@ impl A11yNodeBuilder {
 mod tests {
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
-    use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
+    use super::{A11y, A11yNodeBuilder, A11ySubtreeBuilder, ROOT_NODE_ID};
     use crate::FocusId;
     use accesskit::{NodeId, Role};
     use std::sync::{Arc, atomic::AtomicBool};
@@ -673,6 +723,36 @@ mod tests {
         builder.pop(); // container
         let update = builder.finalize();
         assert_eq!(update.focus, item);
+    }
+
+    #[test]
+    fn synthetic_subtree_and_active_descendant() {
+        let mut builder = new_builder();
+        let element = NodeId(1);
+        assert!(builder.push(element, test_node()));
+        builder.set_focus(element);
+
+        let (list, option) = (NodeId(2), NodeId(3));
+        let mut list_node = test_node();
+        list_node.push_child(option);
+        let mut subtree = A11ySubtreeBuilder::new(element, &mut builder);
+        assert!(subtree.push_child(list, list_node));
+        assert!(subtree.push_descendant(option, test_node()));
+        subtree.set_active_descendant(option);
+
+        builder.pop(); // element
+        let update = builder.finalize();
+        assert_eq!(update.focus, option);
+        let children = |id| {
+            update
+                .nodes
+                .iter()
+                .find(|(node_id, _)| *node_id == id)
+                .map(|(_, node)| node.children().to_vec())
+        };
+        // Only the subtree's top hangs off the element; the option stays under the list.
+        assert_eq!(children(element), Some(vec![list]));
+        assert_eq!(children(list), Some(vec![option]));
     }
 
     #[test]

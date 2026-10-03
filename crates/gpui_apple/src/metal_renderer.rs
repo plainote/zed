@@ -902,6 +902,10 @@ impl MetalRenderer {
             let data = chunk.as_ptr() as *const c_void;
             command_encoder.set_vertex_bytes(GlassInputIndex::Glass as u64, bytes, data);
             command_encoder.set_fragment_bytes(GlassInputIndex::Glass as u64, bytes, data);
+            let count = chunk.len() as u32;
+            let count_ptr = &count as *const u32 as *const c_void;
+            command_encoder.set_vertex_bytes(GlassInputIndex::Count as u64, 4, count_ptr);
+            command_encoder.set_fragment_bytes(GlassInputIndex::Count as u64, 4, count_ptr);
             command_encoder.draw_primitives_instanced(
                 metal::MTLPrimitiveType::Triangle,
                 0,
@@ -1777,6 +1781,8 @@ enum GlassInputIndex {
     Glass = 1,
     ViewportSize = 2,
     Blurred = 3,
+    /// Spike L1-26: shapes in this draw, so fused groups can find each other.
+    Count = 4,
 }
 
 #[repr(C)]

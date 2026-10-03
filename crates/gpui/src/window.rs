@@ -4903,15 +4903,38 @@ impl Window {
         rim: f32,
         tint: Hsla,
     ) {
+        self.paint_glass_fused(bounds, corner_radius, bezel, refraction, rim, tint, 0, px(0.));
+    }
+
+    /// Spike L1-26: like `paint_glass`, but shapes painted with the same nonzero
+    /// `group` melt together where they come within `fuse` of each other, like drops
+    /// of liquid (a smooth union of their distance fields). The first shape of a group
+    /// supplies the lens, rim and tint for all of them. Groups 1 to 255.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_glass_fused(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radius: Pixels,
+        bezel: Pixels,
+        refraction: Pixels,
+        rim: f32,
+        tint: Hsla,
+        group: u8,
+        fuse: Pixels,
+    ) {
         use crate::Glass;
 
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let opacity = self.element_opacity();
+        // The spare alignment word carries the group (low 8 bits) and the fusion
+        // radius in sixteenths of a device pixel (high 24), so the GPU layout of
+        // `Glass` doesn't change for the other renderers.
+        let fuse_16ths = (f32::from(fuse) * scale_factor * 16.).clamp(0., 16_777_215.) as u32;
         self.next_frame.scene.insert_primitive(Glass {
             order: 0,
-            pad: 0,
+            pad: group as u32 | (fuse_16ths << 8),
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             corner_radius: corner_radius.scale(scale_factor),

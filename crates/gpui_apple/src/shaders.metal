@@ -1337,6 +1337,43 @@ struct GlassFragmentInput {
   float4 position [[position]];
 };
 
+// Spike L1-26: fused glass. A shape's group is the low byte of `pad`; the fusion
+// radius, in sixteenths of a device pixel, is the rest.
+uint glass_group(Glass g) { return g.pad & 0xffu; }
+float glass_fuse(Glass g) { return float(g.pad >> 8) / 16.; }
+
+float glass_sd(float2 p, Glass g) {
+  float2 half_size = float2(g.bounds.size.width, g.bounds.size.height) * 0.5;
+  float2 center = float2(g.bounds.origin.x, g.bounds.origin.y) + half_size;
+  float radius = min(g.corner_radius, min(half_size.x, half_size.y));
+  float2 q = abs(p - center) - (half_size - radius);
+  return length(max(q, 0.)) + min(max(q.x, q.y), 0.) - radius;
+}
+
+// Circular smooth union: outside, two fields within k of each other meet in an arc,
+// like a liquid neck; inside, distances stay exact, so a shape tucked into another
+// leaves no crease (the polynomial smin's ring, seen in the first run).
+float smin_k(float a, float b, float k) {
+  if (k <= 0.) {
+    return min(a, b);
+  }
+  float2 u = max(float2(k - a, k - b), 0.);
+  return max(k, min(a, b)) - length(u);
+}
+
+// The fused field of `leader`'s group at p.
+float glass_field(float2 p, constant Glass *glass, uint count, Glass leader) {
+  uint group = glass_group(leader);
+  float k = glass_fuse(leader);
+  float d = 1e9;
+  for (uint i = 0; i < count; i++) {
+    if (glass_group(glass[i]) == group) {
+      d = smin_k(d, glass_sd(p, glass[i]), k);
+    }
+  }
+  return d;
+}
+
 vertex GlassVertexOutput glass_vertex(uint unit_vertex_id [[vertex_id]],
                                       uint glass_id [[instance_id]],
                                       constant float2 *unit_vertices
@@ -1344,14 +1381,49 @@ vertex GlassVertexOutput glass_vertex(uint unit_vertex_id [[vertex_id]],
                                       constant Glass *glass
                                       [[buffer(GlassInputIndex_Glass)]],
                                       constant Size_DevicePixels *viewport_size
-                                      [[buffer(GlassInputIndex_ViewportSize)]]) {
+                                      [[buffer(GlassInputIndex_ViewportSize)]],
+                                      constant uint *count
+                                      [[buffer(GlassInputIndex_Count)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Glass g = glass[glass_id];
+  Bounds_ScaledPixels bounds = g.bounds;
+  uint group = glass_group(g);
+  if (group != 0u) {
+    // The group's first shape draws the whole fused blob; the others draw nothing.
+    for (uint i = 0; i < glass_id; i++) {
+      if (glass_group(glass[i]) == group) {
+        GlassVertexOutput none;
+        none.glass_id = glass_id;
+        none.position = float4(0., 0., 0., 1.);
+        for (int c = 0; c < 4; c++) {
+          none.clip_distance[c] = -1.;
+        }
+        return none;
+      }
+    }
+    float2 lo = float2(1e9), hi = float2(-1e9);
+    for (uint i = 0; i < *count; i++) {
+      if (glass_group(glass[i]) == group) {
+        float2 o = float2(glass[i].bounds.origin.x, glass[i].bounds.origin.y);
+        float2 sz = float2(glass[i].bounds.size.width, glass[i].bounds.size.height);
+        lo = min(lo, o);
+        hi = max(hi, o + sz);
+      }
+    }
+    // The smooth union bulges by at most k/4 beyond the shapes.
+    float grow = glass_fuse(g) * 0.25 + 2.;
+    lo -= grow;
+    hi += grow;
+    bounds.origin.x = lo.x;
+    bounds.origin.y = lo.y;
+    bounds.size.width = hi.x - lo.x;
+    bounds.size.height = hi.y - lo.y;
+  }
   float4 clip_distance =
-      distance_from_clip_rect(unit_vertex, g.bounds, g.content_mask.bounds);
+      distance_from_clip_rect(unit_vertex, bounds, g.content_mask.bounds);
   GlassVertexOutput output;
   output.glass_id = glass_id;
-  output.position = to_device_position(unit_vertex, g.bounds, viewport_size);
+  output.position = to_device_position(unit_vertex, bounds, viewport_size);
   output.clip_distance[0] = clip_distance.x;
   output.clip_distance[1] = clip_distance.y;
   output.clip_distance[2] = clip_distance.z;
@@ -1364,27 +1436,39 @@ fragment float4 glass_fragment(GlassFragmentInput input [[stage_in]],
                                constant Size_DevicePixels *viewport_size
                                [[buffer(GlassInputIndex_ViewportSize)]],
                                texture2d<float> blurred
-                               [[texture(GlassInputIndex_Blurred)]]) {
+                               [[texture(GlassInputIndex_Blurred)]],
+                               constant uint *count
+                               [[buffer(GlassInputIndex_Count)]]) {
   constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
   Glass g = glass[input.glass_id];
 
   float2 p = input.position.xy;
-  float2 half_size = float2(g.bounds.size.width, g.bounds.size.height) * 0.5;
-  float2 center = float2(g.bounds.origin.x, g.bounds.origin.y) + half_size;
-  float radius = min(g.corner_radius, min(half_size.x, half_size.y));
-  float2 rel = p - center;
-  float2 q = abs(rel) - (half_size - radius);
-  // Signed distance to the rounded rectangle; negative inside.
-  float d = length(max(q, 0.)) + min(max(q.x, q.y), 0.) - radius;
+  float d;
+  float2 n;
+  if (glass_group(g) == 0u) {
+    float2 half_size = float2(g.bounds.size.width, g.bounds.size.height) * 0.5;
+    float2 center = float2(g.bounds.origin.x, g.bounds.origin.y) + half_size;
+    float radius = min(g.corner_radius, min(half_size.x, half_size.y));
+    float2 rel = p - center;
+    float2 q = abs(rel) - (half_size - radius);
+    // Signed distance to the rounded rectangle; negative inside.
+    d = length(max(q, 0.)) + min(max(q.x, q.y), 0.) - radius;
+    // Outward normal of the nearest edge.
+    n = (q.x > 0. && q.y > 0.) ? normalize(q)
+        : (q.x > q.y ? float2(1., 0.) : float2(0., 1.));
+    n *= select(float2(-1.), float2(1.), rel >= 0.);
+  } else {
+    d = glass_field(p, glass, *count, g);
+    // The fused field's gradient, by central differences, is the outward normal.
+    float2 e = float2(1., 0.);
+    float2 grad = float2(glass_field(p + e.xy, glass, *count, g) - glass_field(p - e.xy, glass, *count, g),
+                         glass_field(p + e.yx, glass, *count, g) - glass_field(p - e.yx, glass, *count, g));
+    n = length(grad) > 1e-5 ? normalize(grad) : float2(0., -1.);
+  }
   float coverage = saturate(0.5 - d);
   if (coverage <= 0.) {
     discard_fragment();
   }
-
-  // Outward normal of the nearest edge.
-  float2 n = (q.x > 0. && q.y > 0.) ? normalize(q)
-             : (q.x > q.y ? float2(1., 0.) : float2(0., 1.));
-  n *= select(float2(-1.), float2(1.), rel >= 0.);
 
   // 1 on the rim, 0 once past the bezel; a circular profile, like a lens edge.
   float edge = saturate(1. + d / max(g.bezel, 1.));

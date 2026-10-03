@@ -27,6 +27,8 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
+/// Levels in the glass blur pyramid: 1/2, 1/4, 1/8 and 1/16 of the frame.
+const GLASS_BLUR_LEVELS: usize = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
 pub(crate) struct FontInfo {
@@ -81,6 +83,24 @@ struct DirectXResources {
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+
+    /// Created on the first frame with glass, dropped on resize.
+    glass: Option<GlassTargets>,
+}
+
+/// A copy of the frame (the swap chain's buffer can't be sampled) and the blur
+/// pyramid: down to 1/2^GLASS_BLUR_LEVELS, then back up to 1/2, finest last.
+struct GlassTargets {
+    copy: ID3D11Texture2D,
+    copy_srv: Option<ID3D11ShaderResourceView>,
+    levels: Vec<GlassLevel>,
+}
+
+struct GlassLevel {
+    _texture: ID3D11Texture2D,
+    rtv: Option<ID3D11RenderTargetView>,
+    srv: Option<ID3D11ShaderResourceView>,
+    viewport: D3D11_VIEWPORT,
 }
 
 struct DirectXRenderPipelines {
@@ -92,6 +112,30 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    glass: PipelineState<Glass>,
+    glass_downsample: GlassBlurPass,
+    glass_upsample: GlassBlurPass,
+    /// Clamps, so the blur doesn't wrap the far edge of the frame in.
+    glass_sampler: Option<ID3D11SamplerState>,
+}
+
+struct GlassBlurPass {
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+}
+
+impl GlassBlurPass {
+    fn new(device: &ID3D11Device, module: ShaderModule) -> Result<Self> {
+        let vertex = {
+            let raw_shader = RawShaderBytes::new(module, ShaderTarget::Vertex)?;
+            create_vertex_shader(device, raw_shader.as_bytes())?
+        };
+        let fragment = {
+            let raw_shader = RawShaderBytes::new(module, ShaderTarget::Fragment)?;
+            create_fragment_shader(device, raw_shader.as_bytes())?
+        };
+        Ok(Self { vertex, fragment })
+    }
 }
 
 struct DirectXGlobalElements {
@@ -385,8 +429,7 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
-                // No glass pass here yet (L0-10 fork is Metal only).
-                PrimitiveBatch::Glass(_glass) => Ok(()),
+                PrimitiveBatch::Glass(range) => self.draw_glass(range.start, range.len()),
             }
             .with_context(|| {
                 format!(
@@ -579,6 +622,14 @@ impl DirectXRenderer {
             )?;
         }
 
+        if !scene.glass.is_empty() {
+            self.pipelines.glass.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &scene.glass,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -719,6 +770,81 @@ impl DirectXRenderer {
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
+    }
+
+    /// Blurs what has been drawn so far into the pyramid, then draws the glass
+    /// shapes over the frame, sampling it through their lenses.
+    fn draw_glass(&mut self, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_mut().context("resources missing")?;
+        if resources.glass.is_none() {
+            resources.glass = Some(create_glass_targets(
+                &devices.device,
+                self.width,
+                self.height,
+            )?);
+        }
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let glass = resources.glass.as_ref().context("glass targets missing")?;
+        let context = &devices.device_context;
+        let no_texture: [Option<ID3D11ShaderResourceView>; 1] = [None];
+        unsafe {
+            context.CopyResource(
+                &glass.copy,
+                resources
+                    .render_target
+                    .as_ref()
+                    .context("missing render target")?,
+            );
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.OMSetBlendState(None, None, 0xFFFFFFFF);
+            context.PSSetSamplers(0, Some(slice::from_ref(&self.pipelines.glass_sampler)));
+            let mut source = &glass.copy_srv;
+            for (index, level) in glass.levels.iter().enumerate() {
+                let pass = if index < GLASS_BLUR_LEVELS {
+                    &self.pipelines.glass_downsample
+                } else {
+                    &self.pipelines.glass_upsample
+                };
+                // Unbind the source first: a level is a render target before it is read.
+                context.PSSetShaderResources(0, Some(&no_texture));
+                context.OMSetRenderTargets(Some(slice::from_ref(&level.rtv)), None);
+                context.RSSetViewports(Some(slice::from_ref(&level.viewport)));
+                context.VSSetShader(&pass.vertex, None);
+                context.PSSetShader(&pass.fragment, None);
+                context.PSSetShaderResources(0, Some(slice::from_ref(source)));
+                context.Draw(3, 0);
+                source = &level.srv;
+            }
+            context.PSSetShaderResources(0, Some(&no_texture));
+            context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            // The light, first level goes in t2; the full blur in t0 below.
+            let light = glass.levels.first().and_then(|level| level.srv.clone());
+            context.PSSetShaderResources(2, Some(&[light]));
+        }
+        let blurred = glass.levels.last().and_then(|level| level.srv.clone());
+        self.pipelines.glass.draw_range_with_texture(
+            context,
+            &[blurred],
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            slice::from_ref(&self.pipelines.glass_sampler),
+            start as u32,
+            len as u32,
+        )?;
+        unsafe {
+            context.VSSetShaderResources(0, Some(&no_texture));
+            context.PSSetShaderResources(0, Some(&no_texture));
+            context.PSSetShaderResources(2, Some(&no_texture));
+            context.PSSetSamplers(0, Some(slice::from_ref(&self.globals.sampler)));
+        }
+        Ok(())
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
@@ -905,6 +1031,7 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             path_intermediate_srv,
             viewport,
+            glass: None,
         })
     }
 
@@ -931,6 +1058,7 @@ impl DirectXResources {
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
         self.viewport = viewport;
+        self.glass = None;
         Ok(())
     }
 }
@@ -994,6 +1122,31 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
 
+        let glass = PipelineState::new(
+            device,
+            "glass_pipeline",
+            ShaderModule::Glass,
+            4,
+            create_blend_state(device)?,
+        )?;
+        let glass_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
@@ -1003,6 +1156,10 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            glass,
+            glass_downsample: GlassBlurPass::new(device, ShaderModule::GlassDownsample)?,
+            glass_upsample: GlassBlurPass::new(device, ShaderModule::GlassUpsample)?,
+            glass_sampler,
         })
     }
 }
@@ -1432,6 +1589,73 @@ fn create_path_intermediate_texture(
     Ok((texture, Some(shader_resource_view.unwrap())))
 }
 
+fn create_glass_targets(device: &ID3D11Device, width: u32, height: u32) -> Result<GlassTargets> {
+    let texture = |width: u32, height: u32, render_target: bool| -> Result<ID3D11Texture2D> {
+        let bind = D3D11_BIND_SHADER_RESOURCE.0
+            | if render_target {
+                D3D11_BIND_RENDER_TARGET.0
+            } else {
+                0
+            };
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: bind as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut output = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut output))? };
+        output.context("glass texture missing")
+    };
+    let srv = |texture: &ID3D11Texture2D| -> Result<Option<ID3D11ShaderResourceView>> {
+        let mut view = None;
+        unsafe { device.CreateShaderResourceView(texture, None, Some(&mut view))? };
+        Ok(view)
+    };
+    let copy = texture(width, height, false)?;
+    let copy_srv = srv(&copy)?;
+    let level_size = |level: usize| {
+        let divisor = 2u32 << level;
+        ((width / divisor).max(1), (height / divisor).max(1))
+    };
+    let levels = (0..GLASS_BLUR_LEVELS)
+        .map(level_size)
+        .chain((0..GLASS_BLUR_LEVELS - 1).rev().map(level_size))
+        .map(|(width, height)| {
+            let texture = texture(width, height, true)?;
+            let mut rtv = None;
+            unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+            Ok(GlassLevel {
+                srv: srv(&texture)?,
+                rtv,
+                _texture: texture,
+                viewport: D3D11_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: width as f32,
+                    Height: height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GlassTargets {
+        copy,
+        copy_srv,
+        levels,
+    })
+}
+
 #[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
@@ -1713,6 +1937,9 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        GlassDownsample,
+        GlassUpsample,
+        Glass,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1789,6 +2016,18 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::GlassDownsample => match target {
+                    ShaderTarget::Vertex => GLASS_DOWNSAMPLE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => GLASS_DOWNSAMPLE_FRAGMENT_BYTES,
+                },
+                ShaderModule::GlassUpsample => match target {
+                    ShaderTarget::Vertex => GLASS_UPSAMPLE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => GLASS_UPSAMPLE_FRAGMENT_BYTES,
+                },
+                ShaderModule::Glass => match target {
+                    ShaderTarget::Vertex => GLASS_VERTEX_BYTES,
+                    ShaderTarget::Fragment => GLASS_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1877,6 +2116,9 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::GlassDownsample => "glass_downsample",
+                ShaderModule::GlassUpsample => "glass_upsample",
+                ShaderModule::Glass => "glass",
             }
         }
     }

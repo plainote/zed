@@ -1266,3 +1266,172 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Glass (Vesper), the HLSL port of the Metal and WGSL passes
+**
+*/
+
+// Everything drawn before a glass batch is blurred into a half-resolution
+// dual-Kawase pyramid; each glass shape then samples the blur through a lens
+// that bends its edge band. The blur passes read t_sprite with a clamping
+// sampler; the glass pass reads the full blur from t_sprite, its shapes from
+// t1 and the first, lightly blurred level from t2.
+
+struct Glass {
+    uint order;
+    uint pad;
+    Bounds bounds;
+    Bounds content_mask;
+    float corner_radius;
+    float bezel;
+    float refraction;
+    float rim;
+    Hsla tint;
+    float dispersion;
+    // 0 samples the first, lightly blurred level (t_light), 1 the full blur.
+    float frost;
+    uint2 pad2;
+};
+
+StructuredBuffer<Glass> glass_shapes: register(t1);
+Texture2D<float4> t_light: register(t2);
+
+struct GlassBlurVertexOutput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+};
+
+// One triangle that covers the whole target.
+GlassBlurVertexOutput glass_blur_vertex(uint vertex_id) {
+    float2 uv = float2(float((vertex_id << 1u) & 2u), float(vertex_id & 2u));
+    GlassBlurVertexOutput output;
+    output.position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    output.uv = uv;
+    return output;
+}
+
+GlassBlurVertexOutput glass_downsample_vertex(uint vertex_id: SV_VertexID) {
+    return glass_blur_vertex(vertex_id);
+}
+
+GlassBlurVertexOutput glass_upsample_vertex(uint vertex_id: SV_VertexID) {
+    return glass_blur_vertex(vertex_id);
+}
+
+float2 glass_texel(Texture2D<float4> t) {
+    float width, height;
+    t.GetDimensions(width, height);
+    return 1.0 / float2(width, height);
+}
+
+// The target is half the source, so half a target texel is one source texel.
+float4 glass_downsample_fragment(GlassBlurVertexOutput input): SV_Target {
+    float2 o = glass_texel(t_sprite);
+    float4 sum = t_sprite.SampleLevel(s_sprite, input.uv, 0.0) * 4.0;
+    sum += t_sprite.SampleLevel(s_sprite, input.uv - o, 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + o, 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(o.x, -o.y), 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv - float2(o.x, -o.y), 0.0);
+    return sum / 8.0;
+}
+
+// The target is twice the source, so half a target texel is a quarter source texel.
+float4 glass_upsample_fragment(GlassBlurVertexOutput input): SV_Target {
+    float2 o = 0.25 * glass_texel(t_sprite);
+    float4 sum = t_sprite.SampleLevel(s_sprite, input.uv + float2(-o.x * 2.0, 0.0), 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(-o.x, o.y), 0.0) * 2.0;
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(0.0, o.y * 2.0), 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(o.x, o.y), 0.0) * 2.0;
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(o.x * 2.0, 0.0), 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(o.x, -o.y), 0.0) * 2.0;
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(0.0, -o.y * 2.0), 0.0);
+    sum += t_sprite.SampleLevel(s_sprite, input.uv + float2(-o.x, -o.y), 0.0) * 2.0;
+    return sum / 12.0;
+}
+
+struct GlassVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation uint glass_id: TEXCOORD0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct GlassFragmentInput {
+    float4 position: SV_Position;
+    nointerpolation uint glass_id: TEXCOORD0;
+};
+
+GlassVertexOutput glass_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint glass_id = batch_start_index + instance_id;
+    Glass g = glass_shapes[glass_id];
+    GlassVertexOutput output;
+    output.position = to_device_position(unit_vertex, g.bounds);
+    output.glass_id = glass_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, g.bounds, g.content_mask);
+    return output;
+}
+
+float4 glass_fragment(GlassFragmentInput input): SV_Target {
+    Glass g = glass_shapes[input.glass_id];
+
+    float2 p = input.position.xy;
+    float2 half_size = g.bounds.size * 0.5;
+    float2 center = g.bounds.origin + half_size;
+    float radius = min(g.corner_radius, min(half_size.x, half_size.y));
+    float2 rel = p - center;
+    float2 q = abs(rel) - (half_size - radius);
+    // Signed distance to the rounded rectangle; negative inside.
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+    float coverage = saturate(0.5 - d);
+    if (coverage <= 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float4 tint = hsla_to_rgba(g.tint);
+    // A 1x1 blur texture means the frame couldn't be read: flat tint only.
+    float2 texel = glass_texel(t_sprite);
+    if (texel.x >= 1.0) {
+        return float4(tint.rgb, tint.a * coverage);
+    }
+
+    // Outward normal of the nearest edge.
+    float2 n = q.x > q.y ? float2(1.0, 0.0) : float2(0.0, 1.0);
+    if (q.x > 0.0 && q.y > 0.0) {
+        n = normalize(q);
+    }
+    n *= float2(rel.x >= 0.0 ? 1.0 : -1.0, rel.y >= 0.0 ? 1.0 : -1.0);
+
+    // 1 on the rim, 0 once past the bezel; a circular profile, like a lens edge.
+    float edge = saturate(1.0 + d / max(g.bezel, 1.0));
+    float bend = 1.0 - sqrt(saturate(1.0 - edge * edge));
+
+    float2 viewport = global_viewport_size;
+    float2 offset = -n * bend * g.refraction;
+    float2 uv = (p + offset) / viewport;
+    // A little dispersion along the edge.
+    float2 dispersion = -n * bend * g.dispersion * g.refraction / viewport;
+    float3 frosted = float3(
+        t_sprite.SampleLevel(s_sprite, uv + dispersion, 0.0).r,
+        t_sprite.SampleLevel(s_sprite, uv, 0.0).g,
+        t_sprite.SampleLevel(s_sprite, uv - dispersion, 0.0).b
+    );
+    float3 clear = float3(
+        t_light.SampleLevel(s_sprite, uv + dispersion, 0.0).r,
+        t_light.SampleLevel(s_sprite, uv, 0.0).g,
+        t_light.SampleLevel(s_sprite, uv - dispersion, 0.0).b
+    );
+    float3 color = lerp(clear, frosted, saturate(g.frost));
+
+    color = lerp(color, tint.rgb, tint.a);
+
+    // Rim light from the top left: a hairline plus a soft glow inside the bezel.
+    float facing = dot(n, normalize(float2(-0.45, -1.0)));
+    float hairline = saturate(1.0 + d / 1.5);
+    float glow = edge * edge * edge;
+    color += g.rim * (hairline * (0.25 + 0.5 * abs(facing)) + glow * 0.18 * max(facing, 0.0));
+
+    // The blend state is straight alpha (SRC_ALPHA, INV_SRC_ALPHA).
+    return float4(saturate(color), coverage);
+}

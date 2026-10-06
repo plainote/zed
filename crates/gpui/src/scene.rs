@@ -196,6 +196,9 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             glass_start: 0,
             glass_iter: self.glass.iter().peekable(),
+            scene: self,
+            blurred: false,
+            drawn: Vec::new(),
         }
     }
 }
@@ -298,12 +301,99 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     glass_start: usize,
     glass_iter: Peekable<slice::Iter<'a, Glass>>,
+    scene: &'a Scene,
+    /// A glass batch has blurred the frame into the pyramid already.
+    blurred: bool,
+    /// What has been drawn since that blur, while glass is still to come.
+    drawn: Vec<Bounds<ScaledPixels>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch;
 
+    /// Glass reuses the last pyramid unless something drawn since it lies under one of
+    /// its shapes. GPUI orders a primitive one above whatever it overlaps, so glass
+    /// over different content lands in different batches; without this, each would
+    /// rebuild the pyramid, the costly part of the pass. Shapes in one batch already
+    /// skip each other's content, so a reused pyramid looks the same.
     fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.next_batch()?;
+        let scene = self.scene;
+        let visible = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            bounds.intersect(&mask.bounds)
+        };
+        match batch {
+            PrimitiveBatch::Glass { range, .. } => {
+                let glass = &scene.glass[range.clone()];
+                let blur = !self.blurred
+                    || glass.iter().any(|g| {
+                        let shape = visible(&g.bounds, &g.content_mask);
+                        self.drawn.iter().any(|drawn| drawn.intersects(&shape))
+                    });
+                if blur {
+                    self.blurred = true;
+                    self.drawn.clear();
+                }
+                // Later glass sitting on this glass needs it in the pyramid.
+                self.drawn
+                    .extend(glass.iter().map(|g| visible(&g.bounds, &g.content_mask)));
+                Some(PrimitiveBatch::Glass { range, blur })
+            }
+            batch => {
+                if self.blurred && self.glass_iter.peek().is_some() {
+                    let drawn = &mut self.drawn;
+                    match &batch {
+                        PrimitiveBatch::Shadows(range) => {
+                            drawn.extend(scene.shadows[range.clone()].iter().map(|s| {
+                                visible(&s.bounds.dilate(s.blur_radius * 3.), &s.content_mask)
+                            }))
+                        }
+                        PrimitiveBatch::Quads(range) => drawn.extend(
+                            scene.quads[range.clone()]
+                                .iter()
+                                .map(|q| visible(&q.bounds, &q.content_mask)),
+                        ),
+                        PrimitiveBatch::Paths(range) => drawn.extend(
+                            scene.paths[range.clone()]
+                                .iter()
+                                .map(|p| visible(&p.bounds, &p.content_mask)),
+                        ),
+                        PrimitiveBatch::Underlines(range) => drawn.extend(
+                            scene.underlines[range.clone()]
+                                .iter()
+                                .map(|u| visible(&u.bounds, &u.content_mask)),
+                        ),
+                        PrimitiveBatch::MonochromeSprites { range, .. } => drawn.extend(
+                            scene.monochrome_sprites[range.clone()]
+                                .iter()
+                                .map(|s| visible(&s.bounds, &s.content_mask)),
+                        ),
+                        PrimitiveBatch::SubpixelSprites { range, .. } => drawn.extend(
+                            scene.subpixel_sprites[range.clone()]
+                                .iter()
+                                .map(|s| visible(&s.bounds, &s.content_mask)),
+                        ),
+                        PrimitiveBatch::PolychromeSprites { range, .. } => drawn.extend(
+                            scene.polychrome_sprites[range.clone()]
+                                .iter()
+                                .map(|s| visible(&s.bounds, &s.content_mask)),
+                        ),
+                        PrimitiveBatch::Surfaces(range) => drawn.extend(
+                            scene.surfaces[range.clone()]
+                                .iter()
+                                .map(|s| visible(&s.bounds, &s.content_mask)),
+                        ),
+                        PrimitiveBatch::Glass { .. } => {}
+                    }
+                }
+                Some(batch)
+            }
+        }
+    }
+}
+
+impl BatchIterator<'_> {
+    fn next_batch(&mut self) -> Option<PrimitiveBatch> {
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -331,7 +421,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
             ),
-            (self.glass_iter.peek().map(|g| g.order), PrimitiveKind::Glass),
+            (
+                self.glass_iter.peek().map(|g| g.order),
+                PrimitiveKind::Glass,
+            ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -491,7 +584,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     glass_end += 1;
                 }
                 self.glass_start = glass_end;
-                Some(PrimitiveBatch::Glass(glass_start..glass_end))
+                Some(PrimitiveBatch::Glass {
+                    range: glass_start..glass_end,
+                    blur: true,
+                })
             }
         }
     }
@@ -525,7 +621,12 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
-    Glass(Range<usize>),
+    /// Glass shapes. With `blur`, the renderer first blurs what has been drawn into
+    /// the pyramid; without it, the shapes sample the pyramid the last batch built.
+    Glass {
+        range: Range<usize>,
+        blur: bool,
+    },
 }
 
 impl PrimitiveBatch {
@@ -558,7 +659,9 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
-            Self::Glass(range) => format!("glass ({})", range.len()),
+            Self::Glass { range, blur } => {
+                format!("glass ({}, blur: {blur})", range.len())
+            }
         }
     }
 }
@@ -1055,5 +1158,96 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod glass_tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(w),
+                height: ScaledPixels(h),
+            },
+        }
+    }
+
+    fn mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: rect(0., 0., 1000., 1000.),
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: mask(),
+            ..Default::default()
+        }
+    }
+
+    fn glass(bounds: Bounds<ScaledPixels>) -> Glass {
+        Glass {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: mask(),
+            corner_radius: ScaledPixels(0.),
+            bezel: ScaledPixels(0.),
+            refraction: ScaledPixels(0.),
+            rim: 0.,
+            tint: Hsla::default(),
+            dispersion: 0.,
+            frost: 0.,
+            pad2: [0; 2],
+        }
+    }
+
+    fn blurs(scene: &Scene) -> Vec<bool> {
+        scene
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::Glass { blur, .. } => Some(blur),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn glass_reuses_the_pyramid_unless_something_new_is_under_it() {
+        // Two buttons over different content land in two batches. The first's label
+        // isn't under the second, so the second reuses the pyramid.
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 1000., 1000.)));
+        scene.insert_primitive(quad(rect(0., 0., 100., 100.)));
+        scene.insert_primitive(glass(rect(0., 0., 100., 100.)));
+        scene.insert_primitive(quad(rect(10., 10., 50., 10.)));
+        scene.insert_primitive(glass(rect(200., 0., 100., 100.)));
+        scene.insert_primitive(quad(rect(210., 10., 50., 10.)));
+        scene.finish();
+        assert_eq!(blurs(&scene), [true, false]);
+
+        // Glass on glass needs the lower glass in the pyramid.
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 1000., 1000.)));
+        scene.insert_primitive(glass(rect(0., 0., 400., 400.)));
+        scene.insert_primitive(quad(rect(10., 10., 50., 10.)));
+        scene.insert_primitive(glass(rect(100., 100., 100., 100.)));
+        scene.finish();
+        assert_eq!(blurs(&scene), [true, true]);
+
+        // So does glass over something drawn after the last pyramid.
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 1000., 1000.)));
+        scene.insert_primitive(glass(rect(0., 0., 100., 100.)));
+        scene.insert_primitive(quad(rect(10., 10., 50., 10.)));
+        scene.insert_primitive(quad(rect(300., 0., 200., 200.)));
+        scene.insert_primitive(quad(rect(310., 10., 100., 100.)));
+        scene.insert_primitive(glass(rect(320., 20., 50., 50.)));
+        scene.finish();
+        assert_eq!(blurs(&scene), [true, true]);
     }
 }

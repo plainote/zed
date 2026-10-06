@@ -787,15 +787,17 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
-                PrimitiveBatch::Glass(range) => {
-                    command_encoder.end_encoding();
-                    self.blur_for_glass(texture, viewport_size, command_buffer);
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
+                PrimitiveBatch::Glass { range, blur } => {
+                    if blur {
+                        command_encoder.end_encoding();
+                        self.blur_for_glass(texture, viewport_size, command_buffer);
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            None,
+                        );
+                    }
                     self.draw_glass(&scene.glass[range], viewport_size, command_encoder);
                 }
             }

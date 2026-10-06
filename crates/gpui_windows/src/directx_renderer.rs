@@ -429,7 +429,9 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
-                PrimitiveBatch::Glass(range) => self.draw_glass(range.start, range.len()),
+                PrimitiveBatch::Glass { range, blur } => {
+                    self.draw_glass(range.start, range.len(), blur)
+                }
             }
             .with_context(|| {
                 format!(
@@ -772,9 +774,9 @@ impl DirectXRenderer {
         )
     }
 
-    /// Blurs what has been drawn so far into the pyramid, then draws the glass
-    /// shapes over the frame, sampling it through their lenses.
-    fn draw_glass(&mut self, start: usize, len: usize) -> Result<()> {
+    /// With `blur`, blurs what has been drawn so far into the pyramid; then draws the
+    /// glass shapes over the frame, sampling the pyramid through their lenses.
+    fn draw_glass(&mut self, start: usize, len: usize, blur: bool) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
@@ -792,36 +794,41 @@ impl DirectXRenderer {
         let context = &devices.device_context;
         let no_texture: [Option<ID3D11ShaderResourceView>; 1] = [None];
         unsafe {
-            context.CopyResource(
-                &glass.copy,
-                resources
-                    .render_target
-                    .as_ref()
-                    .context("missing render target")?,
-            );
             context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             context.OMSetBlendState(None, None, 0xFFFFFFFF);
             context.PSSetSamplers(0, Some(slice::from_ref(&self.pipelines.glass_sampler)));
-            let mut source = &glass.copy_srv;
-            for (index, level) in glass.levels.iter().enumerate() {
-                let pass = if index < GLASS_BLUR_LEVELS {
-                    &self.pipelines.glass_downsample
-                } else {
-                    &self.pipelines.glass_upsample
-                };
-                // Unbind the source first: a level is a render target before it is read.
+        }
+        if blur {
+            let render_target = resources
+                .render_target
+                .as_ref()
+                .context("missing render target")?;
+            unsafe {
+                context.CopyResource(&glass.copy, render_target);
+                let mut source = &glass.copy_srv;
+                for (index, level) in glass.levels.iter().enumerate() {
+                    let pass = if index < GLASS_BLUR_LEVELS {
+                        &self.pipelines.glass_downsample
+                    } else {
+                        &self.pipelines.glass_upsample
+                    };
+                    // Unbind the source first: a level is a render target before it is read.
+                    context.PSSetShaderResources(0, Some(&no_texture));
+                    context.OMSetRenderTargets(Some(slice::from_ref(&level.rtv)), None);
+                    context.RSSetViewports(Some(slice::from_ref(&level.viewport)));
+                    context.VSSetShader(&pass.vertex, None);
+                    context.PSSetShader(&pass.fragment, None);
+                    context.PSSetShaderResources(0, Some(slice::from_ref(source)));
+                    context.Draw(3, 0);
+                    source = &level.srv;
+                }
                 context.PSSetShaderResources(0, Some(&no_texture));
-                context.OMSetRenderTargets(Some(slice::from_ref(&level.rtv)), None);
-                context.RSSetViewports(Some(slice::from_ref(&level.viewport)));
-                context.VSSetShader(&pass.vertex, None);
-                context.PSSetShader(&pass.fragment, None);
-                context.PSSetShaderResources(0, Some(slice::from_ref(source)));
-                context.Draw(3, 0);
-                source = &level.srv;
+                context
+                    .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
             }
-            context.PSSetShaderResources(0, Some(&no_texture));
-            context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
-            context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+        }
+        unsafe {
             // The light, first level goes in t2; the full blur in t0 below.
             let light = glass.levels.first().and_then(|level| level.srv.clone());
             context.PSSetShaderResources(2, Some(&[light]));

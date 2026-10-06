@@ -1710,8 +1710,12 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    PrimitiveBatch::Glass(range) => {
+                    PrimitiveBatch::Glass { range, blur } => {
                         if self.uses_webgl_instance_data {
+                            continue;
+                        }
+                        if !blur {
+                            self.draw_glass(&scene.glass[range], &mut instance_offset, &mut pass)?;
                             continue;
                         }
                         drop(pass);

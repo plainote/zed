@@ -900,6 +900,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn resize(&mut self, size: Size<Pixels>);
+    /// Resizes the content to `size` with the next frame, keeping the top-left corner, so the
+    /// new size and that frame reach the screen together; a platform that can't, resizes now.
+    fn resize_with_next_frame(&mut self, size: Size<Pixels>) {
+        self.resize(size);
+    }
+    /// The pending `resize_with_next_frame`, which GPUI runs right before that frame draws,
+    /// after its next-frame callbacks and outside any update.
+    fn next_frame_resize(&self) -> Option<Box<dyn FnOnce()>> {
+        None
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;

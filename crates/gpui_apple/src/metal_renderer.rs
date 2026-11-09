@@ -23,9 +23,18 @@ use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
 };
 use objc::{self, msg_send, sel, sel_impl};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -44,6 +53,9 @@ const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 const GLASS_BLUR_LEVELS: usize = 4;
 /// `set_vertex_bytes` takes at most 4 KB, so glass is drawn in chunks.
 const GLASS_PER_DRAW: usize = 4096 / mem::size_of::<Glass>();
+/// The longest `FramesFinished` waits. A launcher frame takes the GPU a millisecond or two;
+/// this only bounds a stalled GPU, after which the present goes ahead.
+const GPU_WAIT: Duration = Duration::from_millis(50);
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -119,6 +131,12 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    async_presents: Arc<AsyncPresents>,
+    /// Frames counted as the GPU finishes them (`FramesFinished`).
+    counted: u64,
+    /// The next transactional present waits until the GPU has finished its frame, so a
+    /// transaction that resizes the window never shows before that frame is ready.
+    completes_before_present: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -151,6 +169,51 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// Frames presented on their own, outside a Core Animation transaction. Each goes to the
+/// layer from its command buffer's scheduled handler, on a Metal thread, and reaches the
+/// screen once the GPU has finished it, so one committed before a transactional present
+/// could land after it: a frame drawn for a window's old size would replace the one drawn
+/// for its new size. Before a switch to transactional presents, the caller waits until
+/// they've finished (`FramesFinished`). A present that still comes due while the layer
+/// presents with the transaction, or after a transactional present superseded it (each
+/// starts a new epoch), drops its frame, under the lock that orders it against both.
+#[derive(Default)]
+struct AsyncPresents {
+    state: Mutex<AsyncPresentState>,
+    finished: Condvar,
+}
+
+#[derive(Default)]
+struct AsyncPresentState {
+    finished: u64,
+    epoch: u64,
+    transactional: bool,
+    dropped: u64,
+    timeouts: u64,
+}
+
+/// Waits until the frames counted so far have finished on the GPU.
+pub struct FramesFinished {
+    presents: Arc<AsyncPresents>,
+    counted: u64,
+}
+
+impl FramesFinished {
+    /// Blocks for at most `GPU_WAIT`; call it without holding a lock the GPU's handlers or the
+    /// app might need.
+    pub fn wait(self) {
+        let deadline = Instant::now() + GPU_WAIT;
+        let mut state = self.presents.state.lock();
+        while state.finished < self.counted {
+            if self.presents.finished.wait_until(&mut state, deadline).timed_out() {
+                state.timeouts += 1;
+                log::warn!("frames unfinished after {GPU_WAIT:?} ({} times)", state.timeouts);
+                return;
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -368,6 +431,9 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            async_presents: Arc::default(),
+            counted: 0,
+            completes_before_present: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -414,10 +480,44 @@ impl MetalRenderer {
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
+        if presents_with_transaction == self.presents_with_transaction {
+            return;
+        }
         self.presents_with_transaction = presents_with_transaction;
+        if presents_with_transaction {
+            self.async_presents.state.lock().transactional = true;
+        }
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
         }
+        if !presents_with_transaction {
+            self.async_presents.state.lock().transactional = false;
+        }
+    }
+
+    /// What a switch to transactional presents waits for first (`AsyncPresents`).
+    pub fn frames_finished(&self) -> FramesFinished {
+        FramesFinished {
+            presents: self.async_presents.clone(),
+            counted: self.counted,
+        }
+    }
+
+    /// Counts the frame as the GPU finishes it, for `FramesFinished`.
+    fn count(&mut self, command_buffer: &metal::CommandBufferRef) {
+        let presents = self.async_presents.clone();
+        let finished = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+            presents.state.lock().finished += 1;
+            presents.finished.notify_all();
+        });
+        command_buffer.add_completed_handler(&finished.copy());
+        self.counted += 1;
+    }
+
+    /// Whether transactional presents wait for the GPU to finish their frame: set for a
+    /// frame that resizes the window, whose new frame must not reach the screen first.
+    pub fn set_completes_before_present(&mut self, completes: bool) {
+        self.completes_before_present = completes;
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -526,11 +626,32 @@ impl MetalRenderer {
         };
 
         if self.presents_with_transaction {
-            command_buffer.commit();
-            command_buffer.wait_until_scheduled();
+            if self.completes_before_present {
+                self.count(&command_buffer);
+                command_buffer.commit();
+                self.frames_finished().wait();
+            } else {
+                command_buffer.commit();
+                command_buffer.wait_until_scheduled();
+            }
             drawable.present();
+            self.async_presents.state.lock().epoch += 1;
         } else {
-            command_buffer.present_drawable(drawable);
+            // What `present_drawable` does, ordered by `AsyncPresents`.
+            let drawable = drawable.to_owned();
+            let presents = self.async_presents.clone();
+            let epoch = presents.state.lock().epoch;
+            let present = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+                let mut state = presents.state.lock();
+                if state.transactional || state.epoch != epoch {
+                    state.dropped += 1;
+                    log::debug!("dropped a frame presented too late ({})", state.dropped);
+                } else {
+                    drawable.present();
+                }
+            });
+            command_buffer.add_scheduled_handler(&present.copy());
+            self.count(&command_buffer);
             command_buffer.commit();
         }
     }

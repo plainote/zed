@@ -1200,6 +1200,8 @@ pub struct Window {
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Whether a size was asked for with the next frame (`resize_with_next_frame`).
+    next_frame_resize: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -1574,6 +1576,7 @@ impl Window {
         let visibility = platform_window.visibility();
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
+        let next_frame_resize = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
@@ -1687,6 +1690,7 @@ impl Window {
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
+            let next_frame_resize = next_frame_resize.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
@@ -1773,6 +1777,24 @@ impl Window {
                         .log_err();
                 }
 
+                // A size asked for with this frame, by an update or a next-frame callback
+                // above, is set now: right before the draw, which lays out at it, and outside
+                // any update, since setting it runs the platform's resize callback. A frame
+                // that returned earlier leaves it for the next one.
+                let mut resized = false;
+                if next_frame_resize.take() {
+                    match handle.update(&mut cx, |_, window, _| {
+                        window.platform_window.next_frame_resize()
+                    }) {
+                        Ok(Some(resize)) => {
+                            resize();
+                            resized = true;
+                        }
+                        Ok(None) => {}
+                        Err(_) => next_frame_resize.set(true),
+                    }
+                }
+
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
                 // to prevent display underclocking during active input.
@@ -1780,7 +1802,7 @@ impl Window {
                     || needs_present.get()
                     || input_rate_tracker.borrow_mut().is_high_rate();
 
-                if invalidator.is_dirty() || force_render {
+                if invalidator.is_dirty() || force_render || resized {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -2060,6 +2082,7 @@ impl Window {
             visibility_observers: SubscriberSet::new(),
             hovered,
             needs_present,
+            next_frame_resize,
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -2703,6 +2726,24 @@ impl Window {
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
+    }
+
+    /// Set the content size the window takes with its next frame, keeping its top-left
+    /// corner. Call it in the update, or the next-frame callback, that changes what needs
+    /// the new size: the next frame draws that change, laid out at the new size. On macOS
+    /// the window's new frame and that frame reach the screen in one Core Animation
+    /// transaction. Other platforms resize as [`Self::resize`] does. Asking for the size the
+    /// window has, to within half a device pixel, costs nothing.
+    pub fn resize_with_next_frame(&mut self, size: Size<Pixels>) {
+        self.platform_window.resize_with_next_frame(size);
+        let tolerance = 0.5 / self.scale_factor;
+        let differs = |a: Pixels, b: Pixels| (a.as_f32() - b.as_f32()).abs() >= tolerance;
+        if differs(size.width, self.viewport_size.width)
+            || differs(size.height, self.viewport_size.height)
+        {
+            self.next_frame_resize.set(true);
+            self.refresh();
+        }
     }
 
     /// Returns whether or not the window is currently fullscreen

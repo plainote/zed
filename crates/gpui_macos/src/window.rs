@@ -674,6 +674,11 @@ struct MacWindowState {
     // construction are not queued for delivery to a callback registered later.
     last_visibility: Option<WindowVisibility>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
+    /// The content size the app asked for with the next frame (`resize_with_next_frame`).
+    next_frame_size: Option<Size<Pixels>>,
+    /// Set while this frame's resize holds a Core Animation transaction open
+    /// (`begin_frame_resize`).
+    resize_transaction: Option<RedrawOnResize>,
     moved_callback: Option<Box<dyn FnMut()>>,
     should_close_callback: Option<Box<dyn FnMut() -> bool>>,
     close_callback: Option<Box<dyn FnOnce()>>,
@@ -936,6 +941,35 @@ impl MacWindowState {
         size(px(width as f32), px(height as f32))
     }
 
+    /// The window's frame for the content size the app asked for with this frame, with the
+    /// top-left corner where it is; `None` when it asked for none or the window has it.
+    fn take_next_frame(&mut self) -> Option<NSRect> {
+        let size = self.next_frame_size.take()?;
+        let (width, height) = (size.width.as_f32() as f64, size.height.as_f32() as f64);
+        unsafe {
+            let frame = NSWindow::frame(self.native_window);
+            let content = self.native_window.contentRectForFrameRect_(frame);
+            // AppKit's origin is the bottom-left corner.
+            let top = content.origin.y + content.size.height;
+            let content = NSRect::new(
+                NSPoint::new(content.origin.x, top - height),
+                NSSize::new(width, height),
+            );
+            let next = self.native_window.frameRectForContentRect_(content);
+            // Half a backing pixel: a size that went through f32 and back is the same.
+            let tolerance = 0.5 / self.scale_factor() as f64;
+            let unchanged = [
+                (next.origin.x, frame.origin.x),
+                (next.origin.y, frame.origin.y),
+                (next.size.width, frame.size.width),
+                (next.size.height, frame.size.height),
+            ]
+            .iter()
+            .all(|(a, b)| (a - b).abs() < tolerance);
+            (!unchanged).then_some(next)
+        }
+    }
+
     fn scale_factor(&self) -> f32 {
         get_scale_factor(self.native_window)
     }
@@ -1111,6 +1145,8 @@ impl MacWindow {
                 visibility_callback: None,
                 last_visibility: None,
                 resize_callback: None,
+                next_frame_size: None,
+                resize_transaction: None,
                 moved_callback: None,
                 should_close_callback: None,
                 close_callback: None,
@@ -1442,6 +1478,16 @@ impl PlatformWindow for MacWindow {
                 })
             })
             .detach();
+    }
+
+    fn resize_with_next_frame(&mut self, size: Size<Pixels>) {
+        self.0.lock().next_frame_size = Some(size);
+    }
+
+    fn next_frame_resize(&self) -> Option<Box<dyn FnOnce()>> {
+        let window_state = self.0.clone();
+        let pending = window_state.lock().next_frame_size.is_some();
+        pending.then(|| Box::new(move || begin_frame_resize(&window_state)) as Box<dyn FnOnce()>)
     }
 
     fn merge_all_windows(&self) {
@@ -3157,10 +3203,10 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
 
         if lock.activated_least_once {
             if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
-                callback(Default::default());
+                present_with_transaction(&window_state);
+                request_frame(&window_state, &mut callback, Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
@@ -3278,10 +3324,10 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
-        callback(Default::default());
+        present_with_transaction(&window_state);
+        request_frame(&window_state, &mut callback, Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
@@ -3297,9 +3343,112 @@ extern "C" fn step(view: *mut c_void) {
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
-        callback(Default::default());
+        request_frame(&window_state, &mut callback, Default::default());
         window_state.lock().request_frame_callback = Some(callback);
     }
+}
+
+/// Switches the renderer to presenting with Core Animation's transaction, once the frames it
+/// presented on its own have finished on the GPU (`FramesFinished`, at most 50 ms). It
+/// waits without the window's lock.
+fn present_with_transaction(window_state: &Arc<Mutex<MacWindowState>>) {
+    let finished = window_state.lock().renderer.frames_finished();
+    finished.wait();
+    window_state
+        .lock()
+        .renderer
+        .set_presents_with_transaction(true);
+}
+
+/// Runs the app's frame callback, then commits the transaction a resize in it opened.
+fn request_frame(
+    window_state: &Arc<Mutex<MacWindowState>>,
+    callback: &mut dyn FnMut(RequestFrameOptions),
+    options: RequestFrameOptions,
+) {
+    callback(options);
+    end_frame_resize(window_state);
+}
+
+/// How GPUI's view and layer redraw on a resize, as they were before a frame's resize turned
+/// it off (`begin_frame_resize`).
+struct RedrawOnResize {
+    policy: NSInteger,
+    on_bounds_change: BOOL,
+}
+
+/// `NSViewLayerContentsRedrawNever`.
+const NS_VIEW_LAYER_CONTENTS_REDRAW_NEVER: NSInteger = 0;
+
+/// Sets the window's frame for the size the app asked for with this frame, from inside the
+/// frame: GPUI calls it after its next-frame callbacks, outside any update, right before it
+/// draws (`PlatformWindow::next_frame_resize`). It opens a Core Animation transaction that
+/// stays open until the frame has presented with it (`end_frame_resize`), so the window,
+/// the views AppKit autoresizes with it and the frame drawn for the new size reach the
+/// screen together. Resized on its own, the window would show a frame drawn for the other
+/// size, stretched, until GPUI presented one drawn for it.
+fn begin_frame_resize(window_state: &Arc<Mutex<MacWindowState>>) {
+    let mut lock = window_state.lock();
+    let Some(frame) = lock.take_next_frame() else {
+        return;
+    };
+    let native_window = lock.native_window;
+    let native_view = lock.native_view.as_ptr();
+    let layer = lock.renderer.layer_ptr() as id;
+    drop(lock);
+    present_with_transaction(window_state);
+    // This frame draws GPUI's view at the new size. Left to redraw on the resize, AppKit
+    // would display it again from inside Core Animation's next commit, where a window
+    // drawing every frame can wait a second for a free drawable.
+    let redraw = unsafe {
+        let redraw = RedrawOnResize {
+            policy: msg_send![native_view, layerContentsRedrawPolicy],
+            on_bounds_change: msg_send![layer, needsDisplayOnBoundsChange],
+        };
+        let _: () = msg_send![
+            native_view,
+            setLayerContentsRedrawPolicy: NS_VIEW_LAYER_CONTENTS_REDRAW_NEVER
+        ];
+        let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: NO];
+        redraw
+    };
+    let mut lock = window_state.lock();
+    // The window's new frame mustn't reach the screen before the frame drawn for it is ready.
+    lock.renderer.set_completes_before_present(true);
+    lock.resize_transaction = Some(redraw);
+    drop(lock);
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), begin];
+        // `display: YES` lays out and draws the window's other views (a material view below
+        // GPUI's, say) now, inside this transaction.
+        native_window.setFrame_display_(frame, YES);
+    }
+}
+
+/// Commits the transaction `begin_frame_resize` opened, once the frame has presented in it,
+/// and lets GPUI's view redraw on a resize again as it did before.
+fn end_frame_resize(window_state: &Arc<Mutex<MacWindowState>>) {
+    let mut lock = window_state.lock();
+    let Some(redraw) = lock.resize_transaction.take() else {
+        return;
+    };
+    let native_window = lock.native_window;
+    let native_view = lock.native_view.as_ptr();
+    let layer = lock.renderer.layer_ptr() as id;
+    drop(lock);
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), commit];
+        // The window server draws a borderless window's shadow from its shape.
+        let has_shadow: BOOL = msg_send![native_window, hasShadow];
+        if has_shadow == YES {
+            let _: () = msg_send![native_window, invalidateShadow];
+        }
+        let _: () = msg_send![native_view, setLayerContentsRedrawPolicy: redraw.policy];
+        let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: redraw.on_bounds_change];
+    }
+    let mut lock = window_state.lock();
+    lock.renderer.set_completes_before_present(false);
+    lock.renderer.set_presents_with_transaction(false);
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {

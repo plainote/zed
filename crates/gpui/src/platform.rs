@@ -900,6 +900,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn resize(&mut self, size: Size<Pixels>);
+    /// Resizes the content to `size` with the window's next frame, keeping the window's
+    /// top-left corner: that frame is laid out and drawn at the new size, and the window's
+    /// new size and that frame reach the screen together. A platform that can't tie the
+    /// two together resizes now.
+    fn resize_with_next_frame(&mut self, size: Size<Pixels>) {
+        self.resize(size);
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;

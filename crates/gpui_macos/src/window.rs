@@ -674,6 +674,8 @@ struct MacWindowState {
     // construction are not queued for delivery to a callback registered later.
     last_visibility: Option<WindowVisibility>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
+    /// The content size the app asked for with the next frame (`resize_with_next_frame`).
+    next_frame_size: Option<Size<Pixels>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     should_close_callback: Option<Box<dyn FnMut() -> bool>>,
     close_callback: Option<Box<dyn FnOnce()>>,
@@ -936,6 +938,29 @@ impl MacWindowState {
         size(px(width as f32), px(height as f32))
     }
 
+    /// The window's frame for the content size the app asked for with this frame, with the
+    /// top-left corner where it is; `None` when it asked for none or the window has it.
+    fn take_next_frame(&mut self) -> Option<NSRect> {
+        let size = self.next_frame_size.take()?;
+        let (width, height) = (size.width.as_f32() as f64, size.height.as_f32() as f64);
+        unsafe {
+            let frame = NSWindow::frame(self.native_window);
+            let content = self.native_window.contentRectForFrameRect_(frame);
+            // AppKit's origin is the bottom-left corner.
+            let top = content.origin.y + content.size.height;
+            let content = NSRect::new(
+                NSPoint::new(content.origin.x, top - height),
+                NSSize::new(width, height),
+            );
+            let next = self.native_window.frameRectForContentRect_(content);
+            let unchanged = next.origin.x == frame.origin.x
+                && next.origin.y == frame.origin.y
+                && next.size.width == frame.size.width
+                && next.size.height == frame.size.height;
+            (!unchanged).then_some(next)
+        }
+    }
+
     fn scale_factor(&self) -> f32 {
         get_scale_factor(self.native_window)
     }
@@ -1111,6 +1136,7 @@ impl MacWindow {
                 visibility_callback: None,
                 last_visibility: None,
                 resize_callback: None,
+                next_frame_size: None,
                 moved_callback: None,
                 should_close_callback: None,
                 close_callback: None,
@@ -1442,6 +1468,11 @@ impl PlatformWindow for MacWindow {
                 })
             })
             .detach();
+    }
+
+    fn resize_with_next_frame(&mut self, size: Size<Pixels>) {
+        // The next frame callback sets it (`request_frame`).
+        self.0.lock().next_frame_size = Some(size);
     }
 
     fn merge_all_windows(&self) {
@@ -3160,7 +3191,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
-                callback(Default::default());
+                request_frame(&window_state, &mut callback, Default::default());
 
                 let mut lock = window_state.lock();
                 lock.request_frame_callback = Some(callback);
@@ -3281,7 +3312,7 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
-        callback(Default::default());
+        request_frame(&window_state, &mut callback, Default::default());
 
         let mut lock = window_state.lock();
         lock.request_frame_callback = Some(callback);
@@ -3297,9 +3328,58 @@ extern "C" fn step(view: *mut c_void) {
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
-        callback(Default::default());
+        request_frame(&window_state, &mut callback, Default::default());
         window_state.lock().request_frame_callback = Some(callback);
     }
+}
+
+/// Runs the app's frame callback. When the app asked for a new size with this frame
+/// (`resize_with_next_frame`), the window takes it first, in one Core Animation transaction
+/// with the frame drawn for it: AppKit resizes the window and the views it autoresizes,
+/// GPUI lays out and draws at the new size and presents with the transaction, and the
+/// window server shows them together. Resized on its own, the window would show a frame
+/// drawn for the other size, stretched, until GPUI presented one drawn for it.
+///
+/// The frame is set before the callback, not inside it: AppKit's `setFrameSize:` runs the
+/// resize callback while no app update is running, as for any resize, and the callback
+/// then draws at the size the window already has.
+fn request_frame(
+    window_state: &Arc<Mutex<MacWindowState>>,
+    callback: &mut dyn FnMut(RequestFrameOptions),
+    options: RequestFrameOptions,
+) {
+    let mut lock = window_state.lock();
+    let Some(frame) = lock.take_next_frame() else {
+        drop(lock);
+        callback(options);
+        return;
+    };
+    let native_window = lock.native_window;
+    // Frames the display link presented on their own land first (`MetalRenderer`).
+    lock.renderer.set_presents_with_transaction(true);
+    drop(lock);
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), begin];
+        native_window.setFrame_display_(frame, NO);
+    }
+    // Presented even if nothing else asks: a frame skipped or throttled here would leave
+    // the last one on screen at the new size.
+    callback(RequestFrameOptions {
+        require_presentation: true,
+        ..options
+    });
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), commit];
+        // The window server draws a borderless window's shadow from its shape.
+        let has_shadow: BOOL = msg_send![native_window, hasShadow];
+        if has_shadow == YES {
+            let _: () = msg_send![native_window, invalidateShadow];
+        }
+    }
+    window_state
+        .lock()
+        .renderer
+        .set_presents_with_transaction(false);
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {

@@ -2705,6 +2705,18 @@ impl Window {
         self.platform_window.resize(size);
     }
 
+    /// Set the content size the window takes with its next frame, keeping its top-left
+    /// corner. Call it in the update that changes what needs the new size: the next frame
+    /// draws that change, laid out at the new size. On macOS the window's new frame and
+    /// that frame reach the screen in one Core Animation transaction. Other platforms
+    /// resize as [`Self::resize`] does. Asking for the size the window has costs nothing.
+    pub fn resize_with_next_frame(&mut self, size: Size<Pixels>) {
+        self.platform_window.resize_with_next_frame(size);
+        if size != self.viewport_size {
+            self.refresh();
+        }
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()

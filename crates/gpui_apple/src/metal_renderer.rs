@@ -23,9 +23,18 @@ use metal::{
     CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
 };
 use objc::{self, msg_send, sel, sel_impl};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -44,6 +53,10 @@ const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 const GLASS_BLUR_LEVELS: usize = 4;
 /// `set_vertex_bytes` takes at most 4 KB, so glass is drawn in chunks.
 const GLASS_PER_DRAW: usize = 4096 / mem::size_of::<Glass>();
+/// The longest a switch to transactional presents waits for frames presented on their own.
+/// Their command buffers are already committed, so their presents are due; this only bounds
+/// a present that never comes.
+const ASYNC_PRESENT_WAIT: Duration = Duration::from_millis(50);
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -119,6 +132,10 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// Frames presented on their own, outside a Core Animation transaction: how many were
+    /// committed, and how many Metal has presented so far.
+    async_committed: u64,
+    async_presents: Arc<AsyncPresents>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -151,6 +168,14 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// Counts the frames Metal has presented on their own. It presents each from its command
+/// buffer's scheduled handler, on a thread of its own.
+#[derive(Default)]
+struct AsyncPresents {
+    presented: Mutex<u64>,
+    changed: Condvar,
 }
 
 #[repr(C)]
@@ -368,6 +393,8 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            async_committed: 0,
+            async_presents: Arc::default(),
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -414,9 +441,30 @@ impl MetalRenderer {
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
+        if presents_with_transaction && !self.presents_with_transaction {
+            self.wait_for_async_presents();
+        }
         self.presents_with_transaction = presents_with_transaction;
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
+        }
+    }
+
+    /// Waits until Metal has presented every frame presented on its own. Such a frame goes
+    /// to the layer when its command buffer is scheduled, so one committed just before a
+    /// transactional present could otherwise land after the transaction: a frame drawn for
+    /// the window's old size would then show over its new one.
+    fn wait_for_async_presents(&self) {
+        let deadline = Instant::now() + ASYNC_PRESENT_WAIT;
+        let mut presented = self.async_presents.presented.lock();
+        while *presented < self.async_committed {
+            let changed = &self.async_presents.changed;
+            if changed.wait_until(&mut presented, deadline).timed_out() {
+                log::warn!(
+                    "frames presented on their own still pending after {ASYNC_PRESENT_WAIT:?}"
+                );
+                break;
+            }
         }
     }
 
@@ -530,8 +578,17 @@ impl MetalRenderer {
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
-            command_buffer.present_drawable(drawable);
+            // What `present_drawable` does, counted for `wait_for_async_presents`.
+            let drawable = drawable.to_owned();
+            let presents = self.async_presents.clone();
+            let block = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+                drawable.present();
+                *presents.presented.lock() += 1;
+                presents.changed.notify_all();
+            });
+            command_buffer.add_scheduled_handler(&block.copy());
             command_buffer.commit();
+            self.async_committed += 1;
         }
     }
 

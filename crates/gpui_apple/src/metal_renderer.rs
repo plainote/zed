@@ -145,8 +145,12 @@ pub struct MetalRenderer {
     /// Blur pyramid: `GLASS_BLUR_LEVELS` levels down, then back up to 1/2.
     glass_textures: Vec<metal::Texture>,
     glass_textures_size: Size<DevicePixels>,
+    /// Bound in place of the pyramid while none has been built: glass with an
+    /// opaque tint never samples it, so a frame of only that glass builds none.
+    glass_placeholder: metal::Texture,
     /// Glass samples the drawable, which a framebuffer-only layer forbids, so
-    /// the layer drops that optimisation only while a scene has glass.
+    /// the layer drops that optimisation only while a scene has glass that
+    /// isn't opaque.
     framebuffer_only: bool,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
@@ -453,6 +457,16 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let glass_placeholder = {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            descriptor.set_width(1);
+            descriptor.set_height(1);
+            device.new_texture(&descriptor)
+        };
+
         let framebuffer_only = layer.as_ref().is_some_and(|layer| layer.framebuffer_only());
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -484,6 +498,7 @@ impl MetalRenderer {
             glass_pipeline_state,
             glass_textures: Vec::new(),
             glass_textures_size: Size::default(),
+            glass_placeholder,
             framebuffer_only,
             unit_vertices,
             instance_buffer_pool,
@@ -642,8 +657,8 @@ impl MetalRenderer {
             (viewport_size.height.ceil() as i32).into(),
         );
         // Test builds keep the layer readable for screenshots.
-        let framebuffer_only =
-            scene.glass.is_empty() && !cfg!(any(test, feature = "test-support"));
+        let framebuffer_only = scene.glass.iter().all(Glass::is_opaque)
+            && !cfg!(any(test, feature = "test-support"));
         if framebuffer_only != self.framebuffer_only {
             layer.set_framebuffer_only(framebuffer_only);
             self.framebuffer_only = framebuffer_only;
@@ -883,6 +898,9 @@ impl MetalRenderer {
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
         );
 
+        // The scene asked for a pyramid that a batch of opaque glass didn't build,
+        // so the next batch that samples one builds it, whatever its own `blur`.
+        let mut pyramid_owed = false;
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => {
@@ -949,7 +967,12 @@ impl MetalRenderer {
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
                 PrimitiveBatch::Glass { range, blur } => {
-                    if blur {
+                    // Opaque glass mixes its sample of the blur away entirely, so a
+                    // batch of only that skips the pyramid (ADR-0106).
+                    let samples = !scene.glass[range.clone()].iter().all(Glass::is_opaque);
+                    let blur = blur || pyramid_owed;
+                    pyramid_owed = blur && !samples;
+                    if blur && samples {
                         command_encoder.end_encoding();
                         self.blur_for_glass(texture, viewport_size, command_buffer);
                         command_encoder = new_command_encoder_for_texture(
@@ -1040,9 +1063,8 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) {
-        let Some(blurred) = self.glass_textures.last() else {
-            return;
-        };
+        let blurred = self.glass_textures.last().unwrap_or(&self.glass_placeholder);
+        let light = self.glass_textures.first().unwrap_or(&self.glass_placeholder);
         command_encoder.set_render_pipeline_state(&self.glass_pipeline_state);
         command_encoder.set_vertex_buffer(
             GlassInputIndex::Vertices as u64,
@@ -1060,10 +1082,7 @@ impl MetalRenderer {
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
         command_encoder.set_fragment_texture(GlassInputIndex::Blurred as u64, Some(blurred));
-        command_encoder.set_fragment_texture(
-            GlassInputIndex::Light as u64,
-            self.glass_textures.first().map(|t| t.as_ref()),
-        );
+        command_encoder.set_fragment_texture(GlassInputIndex::Light as u64, Some(light));
         for chunk in glass.chunks(GLASS_PER_DRAW) {
             let bytes = mem::size_of_val(chunk) as u64;
             let data = chunk.as_ptr() as *const c_void;

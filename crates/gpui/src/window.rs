@@ -4944,9 +4944,11 @@ impl Window {
     }
 
     /// Like `paint_glass`, but shapes painted with the same nonzero `group` melt
-    /// together where they come within `fuse` of each other, like drops of liquid (a
-    /// smooth union of their distance fields). The first shape of a group supplies the
-    /// lens, rim and tint for all of them. Groups 1 to 255.
+    /// together like drops of liquid (a smooth union of their distance fields). The
+    /// group's first shape is its hub: each other member fuses with the hub alone,
+    /// where it comes within its own `fuse` of it, and members never fuse with each
+    /// other. The hub's `fuse` is unused. The hub supplies the lens, rim, tint and
+    /// opacity for the whole group. Groups 1 to 255.
     #[allow(clippy::too_many_arguments)]
     pub fn paint_glass_fused(
         &mut self,
@@ -5010,7 +5012,11 @@ impl Window {
             tint: tint.opacity(opacity),
             dispersion: dispersion.clamp(0., 1.),
             frost: frost.clamp(0., 1.),
-            pad2: [0; 2],
+            // The element's transparency (1 - opacity) as f32 bits, so a zeroed word
+            // means fully opaque. Metal takes the opacity back out of the tint and rim
+            // and scales the shape's coverage instead, so a fading shape stops covering
+            // what is behind it; wgpu and Direct3D still fade only the tint and rim.
+            pad2: [(1. - opacity.clamp(0., 1.)).to_bits(), 0],
         });
     }
 

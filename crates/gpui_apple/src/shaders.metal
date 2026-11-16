@@ -1361,18 +1361,27 @@ float smin_k(float a, float b, float k) {
   return max(k, min(a, b)) - length(u);
 }
 
-// The fused field of `leader`'s group at p.
-float glass_field(float2 p, constant Glass *glass, uint count, Glass leader) {
-  uint group = glass_group(leader);
-  float k = glass_fuse(leader);
-  float d = 1e9;
-  for (uint i = 0; i < count; i++) {
+// The fused field at p of the group whose hub (first shape) is glass[hub]. Each
+// other member fuses with the hub alone, at the member's own distance, and members
+// never fuse with each other: the field is the plain minimum of the hub's union
+// with each member, so two bubbles rising side by side each get their own neck.
+float glass_field(float2 p, constant Glass *glass, uint count, uint hub) {
+  uint group = glass_group(glass[hub]);
+  float d_hub = glass_sd(p, glass[hub]);
+  float d = d_hub;
+  for (uint i = hub + 1; i < count; i++) {
     if (glass_group(glass[i]) == group) {
-      d = smin_k(d, glass_sd(p, glass[i]), k);
+      d = min(d, smin_k(d_hub, glass_sd(p, glass[i]), glass_fuse(glass[i])));
     }
   }
   return d;
 }
+
+// The element's opacity, carried as its transparency's f32 bits in pad2[0].
+float glass_opacity(Glass g) { return saturate(1. - as_type<float>(g.pad2[0])); }
+
+// Glass::OPAQUE_TINT: a tint this opaque mixes the blurred frame away entirely.
+constant float GLASS_OPAQUE_TINT = 0.998;
 
 vertex GlassVertexOutput glass_vertex(uint unit_vertex_id [[vertex_id]],
                                       uint glass_id [[instance_id]],
@@ -1402,16 +1411,22 @@ vertex GlassVertexOutput glass_vertex(uint unit_vertex_id [[vertex_id]],
       }
     }
     float2 lo = float2(1e9), hi = float2(-1e9);
-    for (uint i = 0; i < *count; i++) {
+    float k = 0.;
+    for (uint i = glass_id; i < *count; i++) {
       if (glass_group(glass[i]) == group) {
         float2 o = float2(glass[i].bounds.origin.x, glass[i].bounds.origin.y);
         float2 sz = float2(glass[i].bounds.size.width, glass[i].bounds.size.height);
         lo = min(lo, o);
         hi = max(hi, o + sz);
+        if (i != glass_id) {
+          k = max(k, glass_fuse(glass[i]));
+        }
       }
     }
-    // The smooth union bulges by at most k/4 beyond the shapes.
-    float grow = glass_fuse(g) * 0.25 + 2.;
+    // The circular union bulges most where two edges lie together, by
+    // (1 - 1/sqrt 2) k, about 0.293 k, so the largest member distance sets the
+    // growth (the hub's own distance is unused).
+    float grow = k * 0.3 + 2.;
     lo -= grow;
     hi += grow;
     bounds.origin.x = lo.x;
@@ -1460,44 +1475,60 @@ fragment float4 glass_fragment(GlassFragmentInput input [[stage_in]],
         : (q.x > q.y ? float2(1., 0.) : float2(0., 1.));
     n *= select(float2(-1.), float2(1.), rel >= 0.);
   } else {
-    d = glass_field(p, glass, *count, g);
+    // The vertex shader drew this quad only for the group's hub.
+    uint hub = input.glass_id;
+    d = glass_field(p, glass, *count, hub);
     // The fused field's gradient, by central differences, is the outward normal.
     float2 e = float2(1., 0.);
-    float2 grad = float2(glass_field(p + e.xy, glass, *count, g) - glass_field(p - e.xy, glass, *count, g),
-                         glass_field(p + e.yx, glass, *count, g) - glass_field(p - e.yx, glass, *count, g));
+    float2 grad = float2(glass_field(p + e.xy, glass, *count, hub) - glass_field(p - e.xy, glass, *count, hub),
+                         glass_field(p + e.yx, glass, *count, hub) - glass_field(p - e.yx, glass, *count, hub));
     n = length(grad) > 1e-5 ? normalize(grad) : float2(0., -1.);
   }
-  float coverage = saturate(0.5 - d);
+  // The element's opacity fades the shape's coverage, not only its tint and rim,
+  // so a fading glass shape stops covering what is behind it. `tint` and `rim`
+  // arrive already scaled by it (wgpu and Direct3D still fade only those), so it
+  // is taken back out of them here.
+  float opacity = glass_opacity(g);
+  float coverage = saturate(0.5 - d) * opacity;
   if (coverage <= 0.) {
     discard_fragment();
   }
+  float4 tint = hsla_to_rgba(g.tint);
+  bool opaque = tint.a >= opacity * GLASS_OPAQUE_TINT;
+  tint.a = saturate(tint.a / opacity);
+  float rim = g.rim / opacity;
 
   // 1 on the rim, 0 once past the bezel; a circular profile, like a lens edge.
   float edge = saturate(1. + d / max(g.bezel, 1.));
   float bend = 1. - sqrt(saturate(1. - edge * edge));
 
-  float2 viewport = float2(viewport_size->width, viewport_size->height);
-  float2 offset = -n * bend * g.refraction;
-  float2 uv = (p + offset) / viewport;
-  // A colour fringe along the edge, as a fraction of the refraction.
-  float2 dispersion = -n * bend * g.dispersion * g.refraction / viewport;
-  float3 frosted = float3(blurred.sample(s, uv + dispersion).r,
-                          blurred.sample(s, uv).g,
-                          blurred.sample(s, uv - dispersion).b);
-  // Clear glass samples the first, lightly blurred pyramid level instead.
-  float3 clear = float3(light.sample(s, uv + dispersion).r,
-                        light.sample(s, uv).g,
-                        light.sample(s, uv - dispersion).b);
-  float3 color = mix(clear, frosted, saturate(g.frost));
-
-  float4 tint = hsla_to_rgba(g.tint);
-  color = mix(color, tint.rgb, tint.a);
+  float3 color;
+  if (opaque) {
+    // An opaque tint mixes the blurred frame away entirely, so skip sampling it;
+    // the renderer may not have built the pyramid for this batch at all.
+    color = tint.rgb;
+  } else {
+    float2 viewport = float2(viewport_size->width, viewport_size->height);
+    float2 offset = -n * bend * g.refraction;
+    float2 uv = (p + offset) / viewport;
+    // A colour fringe along the edge, as a fraction of the refraction.
+    float2 dispersion = -n * bend * g.dispersion * g.refraction / viewport;
+    float3 frosted = float3(blurred.sample(s, uv + dispersion).r,
+                            blurred.sample(s, uv).g,
+                            blurred.sample(s, uv - dispersion).b);
+    // Clear glass samples the first, lightly blurred pyramid level instead.
+    float3 clear = float3(light.sample(s, uv + dispersion).r,
+                          light.sample(s, uv).g,
+                          light.sample(s, uv - dispersion).b);
+    color = mix(clear, frosted, saturate(g.frost));
+    color = mix(color, tint.rgb, tint.a);
+  }
 
   // Rim light from the top left: a hairline plus a soft glow inside the bezel.
   float facing = dot(n, normalize(float2(-0.45, -1.)));
   float hairline = saturate(1. + d / 1.5);
   float glow = edge * edge * edge;
-  color += g.rim * (hairline * (0.25 + 0.5 * abs(facing)) +
+  color += rim * (hairline * (0.25 + 0.5 * abs(facing)) +
                     glow * 0.18 * max(facing, 0.));
 
   return float4(saturate(color), coverage);

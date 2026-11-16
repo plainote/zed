@@ -928,8 +928,29 @@ pub struct Glass {
     pub dispersion: f32,
     /// How frosted the glass is: 0 samples a lightly blurred frame, 1 the full blur.
     pub frost: f32,
-    /// Keeps the struct a multiple of 16 bytes for GPU storage arrays.
+    /// `pad2[0]` is the element's transparency (1 - opacity) as f32 bits, so zero
+    /// means opaque; see [`Glass::opacity`]. The rest keeps the struct a multiple
+    /// of 16 bytes for GPU storage arrays.
     pub pad2: [u32; 2],
+}
+
+impl Glass {
+    /// A tint alpha at or above this, before the element's opacity, mixes the
+    /// blurred frame away entirely (`shaders.metal` uses the same bound).
+    pub const OPAQUE_TINT: f32 = 0.998;
+
+    /// The opacity of the element that painted this shape. `tint` and `rim`
+    /// already include it.
+    pub fn opacity(&self) -> f32 {
+        (1. - f32::from_bits(self.pad2[0])).clamp(0., 1.)
+    }
+
+    /// Whether the shape needs nothing from the blur pyramid: its tint, before
+    /// the element's opacity, is opaque, or the element is fully transparent.
+    pub fn is_opaque(&self) -> bool {
+        let opacity = self.opacity();
+        opacity <= 0. || self.tint.a >= opacity * Self::OPAQUE_TINT
+    }
 }
 
 /// Everything `Window::paint_glass_styled` needs. The defaults match `paint_glass`.
@@ -1249,5 +1270,22 @@ mod glass_tests {
         scene.insert_primitive(glass(rect(320., 20., 50., 50.)));
         scene.finish();
         assert_eq!(blurs(&scene), [true, true]);
+    }
+
+    #[test]
+    fn glass_is_opaque_when_its_tint_is_before_the_element_opacity() {
+        let with = |a: f32, opacity: f32| Glass {
+            tint: Hsla { a: a * opacity, ..Hsla::default() },
+            pad2: [(1. - opacity).to_bits(), 0],
+            ..glass(rect(0., 0., 10., 10.))
+        };
+        // A zeroed word is an element at full opacity.
+        assert_eq!(glass(rect(0., 0., 10., 10.)).opacity(), 1.);
+        assert!(with(1., 1.).is_opaque());
+        // Fading an opaque shape keeps it opaque: its coverage fades, not its tint.
+        assert!(with(1., 0.25).is_opaque());
+        assert!(with(1., 0.).is_opaque());
+        assert!(!with(0.75, 1.).is_opaque());
+        assert!(!with(0.75, 0.5).is_opaque());
     }
 }
